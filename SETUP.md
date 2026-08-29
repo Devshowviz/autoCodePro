@@ -20,15 +20,17 @@ Python 설치부터 서버 실행까지 순서대로 따라가면 됩니다.
 
 | 항목 | 요구 버전 / 비고 |
 |---|---|
-| Python | **3.10 이상** (Django 5.x 요구사항) |
+| Python | **3.10 ~ 3.14** (Django 5.2 지원 범위) |
 | pip | Python에 기본 포함 |
 | Git | 소스 내려받기용 |
 | 업비트 계정 | Open API 키 발급 + 접속 IP 등록 필요 |
 | 데이터베이스 | SQLite (별도 설치 불필요) |
 
-> 프로젝트의 `.idea` 설정에는 Python 3.9로 되어 있으나, Django 5.x는 3.10 미만을
-> 지원하지 않습니다. **반드시 3.10 이상**을 사용하세요.
-> (이 가이드는 Python 3.11 + Django 5.2 환경에서 검증했습니다.)
+> 프로젝트의 `.idea` 설정에는 Python 3.9로 되어 있으나, Django 5.2는 3.10 미만을
+> 지원하지 않습니다. **3.10 이상**을 사용하세요.
+> 이미 3.13 / 3.14 가 설치되어 있다면 그대로 쓰면 됩니다 — 다운그레이드할 필요
+> 없습니다. `requirements.txt` 의 5개 패키지 모두 3.14까지 공식 지원합니다.
+> (이 가이드는 Python 3.11 + Django 5.2.17 환경에서 실행 검증했습니다.)
 
 ---
 
@@ -36,7 +38,7 @@ Python 설치부터 서버 실행까지 순서대로 따라가면 됩니다.
 
 ### Windows
 
-1. https://www.python.org/downloads/windows/ 에서 3.11 또는 3.12 설치 파일 다운로드
+1. https://www.python.org/downloads/windows/ 에서 설치 파일 다운로드 (3.10~3.14 중 아무 버전)
 2. 설치 실행 시 **`Add python.exe to PATH` 체크박스를 반드시 켜세요** (가장 흔한 실수)
 3. `Install Now` 클릭
 4. 설치 확인 — PowerShell을 새로 열고:
@@ -46,7 +48,11 @@ python --version
 pip --version
 ```
 
-`Python 3.11.x` 처럼 나오면 성공입니다.
+`Python 3.14.x` 처럼 나오면 성공입니다.
+
+> 버전 확인은 대문자 `-V` 또는 `--version` 입니다.
+> 소문자 `python -v` 는 import 추적(verbose) 모드로 대화형 셸에 진입합니다.
+> 그 상태(`>>>` 프롬프트)에서 빠져나오려면 `exit()` 를 입력하세요.
 
 ### macOS
 
@@ -325,8 +331,9 @@ python manage.py runserver
 `ALLOWED_HOSTS` 에 해당 호스트를 추가해야 합니다.
 
 **Python 버전이 3.10 미만**
-`pip install -r requirements.txt` 단계에서 Django 설치가 실패합니다.
-3.10 이상을 설치한 뒤 가상환경을 새로 만드세요 (`venv` 폴더 삭제 후 3단계부터).
+`pip install -r requirements.txt` 단계에서 Django 설치가 실패합니다
+(`Django requires Python >=3.10`). 3.10 이상을 설치한 뒤 가상환경을 새로
+만드세요 (`venv` 폴더 삭제 후 3단계부터).
 
 ---
 
