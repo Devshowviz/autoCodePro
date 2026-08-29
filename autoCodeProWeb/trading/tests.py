@@ -5,6 +5,8 @@ import jwt
 import requests
 from django.test import TestCase
 
+from datetime import date
+
 from .auto_trade import AutoTrader, RSI_PERIOD
 from .utils import get_ticker_price, upbit_order
 
@@ -170,12 +172,11 @@ class StartAutoTradingViewTests(TestCase):
 
 
 class CheckSellTests(TestCase):
-    """ 매도 판단 로직 검증 """
+    """ 매도 판단 로직 검증 (매수가 대비 고정 ±2%) """
 
     def setUp(self):
         self.trader = AutoTrader(budget=10000)
         self.trader.current_order = {"market": "KRW-BTC", "buy_price": 100.0}
-        self.trader.highest_price = 100.0
 
     def run_check(self, current_price):
         with mock.patch(
@@ -195,25 +196,26 @@ class CheckSellTests(TestCase):
         ticker.assert_called_once_with("KRW-BTC")
         coin_list.assert_not_called()
 
-    def test_최고점_대비_1퍼센트_하락하면_매도(self):
-        self.trader.highest_price = 110.0
-        sell_all = self.run_check(108.0)  # 110 * 0.99 = 108.9 >= 108
+    def test_2퍼센트_오르면_익절(self):
+        sell_all = self.run_check(102.0)
         sell_all.assert_called_once()
-        self.assertIn("트레일링 스탑", sell_all.call_args.args[2])
+        self.assertIn("익절", sell_all.call_args.args[2])
 
-    def test_매수가_대비_3퍼센트_하락하면_손절(self):
-        # 최고점을 매수가와 같게 두어 트레일링 스탑이 아닌 손절 경로를 태운다
-        self.trader.highest_price = 96.0
-        sell_all = self.run_check(96.0)  # 100 * 0.97 = 97 >= 96
+    def test_2퍼센트_내리면_손절(self):
+        sell_all = self.run_check(98.0)
         sell_all.assert_called_once()
+        self.assertIn("손절", sell_all.call_args.args[2])
 
-    def test_조건_미달이면_매도하지_않는다(self):
-        sell_all = self.run_check(100.0)
-        sell_all.assert_not_called()
+    def test_2퍼센트_미만_상승은_보유_유지(self):
+        self.run_check(101.9).assert_not_called()
 
-    def test_상승하면_최고점을_갱신한다(self):
-        self.run_check(120.0)
-        self.assertEqual(self.trader.highest_price, 120.0)
+    def test_2퍼센트_미만_하락은_보유_유지(self):
+        self.run_check(98.1).assert_not_called()
+
+    def test_최고점_대비_하락만으로는_팔지_않는다(self):
+        # 트레일링 스탑 제거 확인: 101.5 까지 올랐다가 100.5 로 밀려도 보유
+        self.run_check(101.5).assert_not_called()
+        self.run_check(100.5).assert_not_called()
 
     def test_현재가_조회_실패시_아무것도_하지_않는다(self):
         sell_all = self.run_check(None)
@@ -227,7 +229,6 @@ class SellAllTests(TestCase):
     def setUp(self):
         self.trader = AutoTrader(budget=10000)
         self.trader.current_order = {"market": "KRW-BTC", "buy_price": 100.0}
-        self.trader.highest_price = 120.0
 
     def test_보유수량을_조회해_volume으로_넘긴다(self):
         with mock.patch("trading.auto_trade.get_balance", return_value=0.25) as balance, \
@@ -276,3 +277,84 @@ class GetTickerPriceTests(TestCase):
         with mock.patch("trading.utils.requests.get",
                         side_effect=requests.RequestException("timeout")):
             self.assertIsNone(get_ticker_price("KRW-BTC"))
+
+
+class DailyLossCutTests(TestCase):
+    """ 일일 손실 한도(매매원금 대비 -10%) 검증 """
+
+    def setUp(self):
+        self.trader = AutoTrader(budget=10000)  # 한도 -1,000원
+
+    def test_한도는_매매원금의_10퍼센트(self):
+        self.assertEqual(self.trader.daily_loss_limit(), -1000.0)
+
+    def test_한도_미도달이면_계속_매매한다(self):
+        self.trader.active = True
+        self.trader.daily_pnl = -999.0
+
+        self.assertFalse(self.trader.check_loss_cut())
+        self.assertTrue(self.trader.active)
+
+    def test_한도_도달하면_정지한다(self):
+        self.trader.active = True
+        self.trader.daily_pnl = -1000.0
+        self.assertTrue(self.trader.check_loss_cut())
+        self.assertFalse(self.trader.active)
+
+    def test_한도_도달시_보유_포지션을_청산한다(self):
+        self.trader.active = True
+        self.trader.daily_pnl = -1200.0
+        self.trader.current_order = {"market": "KRW-BTC", "buy_price": 100.0}
+
+        with mock.patch("trading.auto_trade.get_ticker_price", return_value=90.0), \
+             mock.patch.object(self.trader, "sell_all") as sell_all:
+            self.trader.check_loss_cut()
+
+        sell_all.assert_called_once()
+        self.assertEqual(sell_all.call_args.args[0], "KRW-BTC")
+
+    def test_정지_후에는_신규_매수를_시도하지_않는다(self):
+        self.trader.active = True
+        self.trader.daily_pnl = -1500.0
+
+        with mock.patch.object(self.trader, "try_buy") as try_buy, \
+             mock.patch.object(self.trader, "check_sell") as check_sell:
+            self.trader.execute_trade()
+
+        try_buy.assert_not_called()
+        check_sell.assert_not_called()
+        self.assertFalse(self.trader.active)
+
+    def test_실현손익은_수수료를_차감해_누적된다(self):
+        # +2% 익절: 10000 * 0.02 = 200원, 왕복 수수료 10000 * 0.0005 * 2 = 10원
+        pnl = self.trader.record_trade_result(buy_price=100.0, sell_price=102.0)
+        self.assertAlmostEqual(pnl, 190.0)
+        self.assertAlmostEqual(self.trader.daily_pnl, 190.0)
+
+    def test_손절도_수수료를_차감해_누적된다(self):
+        # -2% 손절: -200원 - 10원 = -210원
+        pnl = self.trader.record_trade_result(buy_price=100.0, sell_price=98.0)
+        self.assertAlmostEqual(pnl, -210.0)
+
+    def test_연속_손절이_누적되어_한도에_도달한다(self):
+        # 회당 -210원 -> 5회면 -1,050원으로 한도(-1,000원) 초과
+        for _ in range(5):
+            self.trader.record_trade_result(buy_price=100.0, sell_price=98.0)
+
+        self.assertAlmostEqual(self.trader.daily_pnl, -1050.0)
+        self.trader.active = True
+        self.assertTrue(self.trader.check_loss_cut())
+
+    def test_날짜가_바뀌면_당일_손익이_초기화된다(self):
+        self.trader.daily_pnl = -900.0
+        self.trader.pnl_date = date(2020, 1, 1)
+
+        self.trader.reset_daily_pnl_if_new_day()
+
+        self.assertEqual(self.trader.daily_pnl, 0.0)
+        self.assertEqual(self.trader.pnl_date, self.trader.today())
+
+    def test_같은_날에는_손익이_유지된다(self):
+        self.trader.daily_pnl = -900.0
+        self.trader.reset_daily_pnl_if_new_day()
+        self.assertEqual(self.trader.daily_pnl, -900.0)

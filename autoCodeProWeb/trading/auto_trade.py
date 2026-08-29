@@ -1,5 +1,6 @@
 # trading/auto_trade.py
 import time
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -15,6 +16,10 @@ from .utils import (
 
 trade_logs = []  # ✅ 자동매매 로그 저장 리스트
 
+# 업비트 기준 시간대. KST 는 서머타임이 없어 고정 오프셋으로 충분하며,
+# zoneinfo 와 달리 Windows 에서 tzdata 패키지를 요구하지 않는다.
+KST = timezone(timedelta(hours=9))
+
 # 매매 루프 주기(초).
 # 매수 탐색 시 마켓·시세 조회 2회에 후보 코인당 캔들 조회 1회(최대 5회)까지
 # 나가므로, 업비트 시세 API 제한(초당 10회)을 넘지 않도록 여유를 둔다.
@@ -25,8 +30,14 @@ RSI_CANDLE_UNIT = 1       # 분봉 단위 (1분봉)
 RSI_CANDLE_COUNT = 200    # 조회할 캔들 개수 (Wilder 평활이 수렴하도록 넉넉히)
 RSI_BUY_THRESHOLD = 30    # 이 값 이하이면 과매도로 보고 매수
 
-TRAILING_STOP_RATE = 0.99  # 최고점 대비 -1% 하락 시 매도
-STOP_LOSS_RATE = 0.97      # 매수가 대비 -3% 하락 시 손절
+TAKE_PROFIT_RATE = 0.02   # 매수가 대비 +2% 이면 익절
+STOP_LOSS_RATE = -0.02    # 매수가 대비 -2% 이면 손절
+
+# 당일 누적 실현손익이 매매원금(budget) 대비 이 비율에 도달하면 자동매매를 정지한다.
+DAILY_LOSS_CUT_RATE = -0.10
+
+# 업비트 원화마켓 거래 수수료(편도). 실현손익 계산 시 왕복으로 차감한다.
+FEE_RATE = 0.0005
 
 
 class AutoTrader:
@@ -35,7 +46,14 @@ class AutoTrader:
         self.budget = budget
         self.active = False
         self.current_order = None
-        self.highest_price = 0  # 트레일링 스탑 최고점
+
+        # 당일 누적 실현손익(원)과 그 기준 날짜(KST)
+        self.daily_pnl = 0.0
+        self.pnl_date = self.today()
+
+    # ------------------------------------------------------------------
+    # 공통
+    # ------------------------------------------------------------------
 
     def log(self, message):
         """ ✅ 로그 저장 및 최대 50개까지만 유지 """
@@ -43,6 +61,14 @@ class AutoTrader:
         trade_logs.append(message)
         if len(trade_logs) > 50:
             trade_logs.pop(0)
+
+    def today(self):
+        """ 업비트 기준(KST) 오늘 날짜 """
+        return datetime.now(KST).date()
+
+    def daily_loss_limit(self):
+        """ 당일 허용 손실 한도(원, 음수) """
+        return self.budget * DAILY_LOSS_CUT_RATE
 
     def get_available_krw(self):
         """ ✅ 현재 사용 가능한 원화(KRW) 잔고 조회 """
@@ -57,6 +83,10 @@ class AutoTrader:
             if account.get("currency") == "KRW":
                 return float(account.get("balance", 0))
         return 0  # KRW 잔고가 없으면 0 반환
+
+    # ------------------------------------------------------------------
+    # 지표
+    # ------------------------------------------------------------------
 
     def get_rsi(self, market, period=RSI_PERIOD):
         """ 분봉 데이터로 RSI(Wilder 평활) 계산. 계산 불가하면 None 반환 """
@@ -96,10 +126,17 @@ class AutoTrader:
         rs = avg_gain / avg_loss
         return 100 - (100 / (1 + rs))
 
+    # ------------------------------------------------------------------
+    # 매매 루프
+    # ------------------------------------------------------------------
+
     def start_trading(self):
         """자동매매 시작"""
         self.active = True
-        self.log("🚀 자동매매 시작됨!")
+        self.log(
+            f"🚀 자동매매 시작됨! (매매원금 {self.budget:,}원 / "
+            f"일일 손실 한도 {self.daily_loss_limit():,.0f}원)"
+        )
 
         while self.active:
             # 한 번의 오류로 매매 스레드가 죽지 않도록 감싼다
@@ -116,11 +153,66 @@ class AutoTrader:
 
     def execute_trade(self):
         """자동매매 실행"""
-        if self.current_order is None:
-            self.try_buy()
+        self.reset_daily_pnl_if_new_day()
+
+        # 손실 한도를 넘었으면 보유분을 청산하고 더 이상 매매하지 않는다
+        if self.check_loss_cut():
             return
 
-        self.check_sell()
+        if self.current_order is None:
+            self.try_buy()
+        else:
+            self.check_sell()
+
+    # ------------------------------------------------------------------
+    # 일일 손실 관리
+    # ------------------------------------------------------------------
+
+    def reset_daily_pnl_if_new_day(self):
+        """ 날짜(KST)가 바뀌면 당일 누적 손익을 초기화 """
+        today = self.today()
+        if today != self.pnl_date:
+            self.log(f"📅 날짜 변경 ({self.pnl_date} → {today}) - 당일 손익 초기화")
+            self.pnl_date = today
+            self.daily_pnl = 0.0
+
+    def record_trade_result(self, buy_price, sell_price):
+        """ 매도 후 실현손익을 당일 누적치에 반영
+
+        시장가 주문의 실제 체결가는 즉시 알 수 없으므로,
+        매수·매도 시점의 시세와 왕복 수수료로 근사한다.
+        """
+        gross = self.budget * (sell_price / buy_price - 1)
+        fee = self.budget * FEE_RATE * 2  # 매수 + 매도
+        pnl = gross - fee
+
+        self.daily_pnl += pnl
+        self.log(
+            f"💰 실현손익 {pnl:+,.0f}원 "
+            f"(당일 누적 {self.daily_pnl:+,.0f}원 / 한도 {self.daily_loss_limit():,.0f}원)"
+        )
+        return pnl
+
+    def check_loss_cut(self):
+        """ 당일 손실 한도에 도달했으면 청산 후 정지. 정지했으면 True """
+        if self.daily_pnl > self.daily_loss_limit():
+            return False
+
+        self.log(
+            f"🚨 일일 손실 한도 도달: 당일 누적 {self.daily_pnl:+,.0f}원 "
+            f"(한도 {self.daily_loss_limit():,.0f}원)"
+        )
+
+        if self.current_order is not None:
+            market = self.current_order["market"]
+            self.sell_all(market, get_ticker_price(market), "🚨 로스컷 청산")
+
+        self.stop_trading()
+        return True
+
+    # ------------------------------------------------------------------
+    # 매수 / 매도
+    # ------------------------------------------------------------------
 
     def try_buy(self):
         """ 매수 조건(RSI 과매도)을 만족하는 코인을 찾아 시장가 매수 """
@@ -158,10 +250,9 @@ class AutoTrader:
             "market": market,
             "buy_price": best_coin["trade_price"],
         }
-        self.highest_price = best_coin["trade_price"]
 
     def check_sell(self):
-        """ ✅ 매도 조건 체크 (트레일링 스탑 / 손절) """
+        """ ✅ 매도 조건 체크 (매수가 대비 고정 익절 / 손절) """
         market = self.current_order["market"]
         buy_price = self.current_order["buy_price"]
 
@@ -170,23 +261,16 @@ class AutoTrader:
             self.log(f"⚠️ 현재가 조회 실패: {market}")
             return
 
-        # 최고점 갱신
-        if current_price > self.highest_price:
-            self.highest_price = current_price
-
+        change_rate = current_price / buy_price - 1
         self.log(
             f"📊 현재 가격: {current_price}원 "
-            f"(매수가: {buy_price}원, 최고점: {self.highest_price}원)"
+            f"(매수가: {buy_price}원, {change_rate * 100:+.2f}%)"
         )
 
-        # ✅ 트레일링 스탑: 최고점 대비 하락 시 매도
-        if self.highest_price * TRAILING_STOP_RATE >= current_price:
-            self.sell_all(market, current_price, "🚀 매도 실행 (트레일링 스탑)")
-            return
-
-        # ✅ 손절
-        if current_price <= buy_price * STOP_LOSS_RATE:
-            self.sell_all(market, current_price, "🛑 손절 매도")
+        if change_rate >= TAKE_PROFIT_RATE:
+            self.sell_all(market, current_price, f"🚀 익절 매도 (+{TAKE_PROFIT_RATE:.0%})")
+        elif change_rate <= STOP_LOSS_RATE:
+            self.sell_all(market, current_price, f"🛑 손절 매도 ({STOP_LOSS_RATE:.0%})")
 
     def sell_all(self, market, current_price, reason):
         """ 보유 수량 전량을 시장가로 매도
@@ -196,11 +280,11 @@ class AutoTrader:
         """
         currency = market.split("-")[-1]
         volume = get_balance(currency)
+        buy_price = self.current_order["buy_price"] if self.current_order else None
 
         if volume <= 0:
             self.log(f"⚠️ 매도할 수량이 없음: {market} - 보유 상태를 초기화합니다")
             self.current_order = None
-            self.highest_price = 0
             return
 
         sell_order = upbit_order(market, "sell", volume=volume, ord_type="market")
@@ -209,6 +293,9 @@ class AutoTrader:
             self.log(f"❌ 매도 실패: {market} - {sell_order['error']}")
             return
 
-        self.log(f"{reason}: {market}, 가격: {current_price}원, 수량: {volume}")
+        price_text = f"{current_price}원" if current_price is not None else "시장가"
+        self.log(f"{reason}: {market}, 가격: {price_text}, 수량: {volume}")
         self.current_order = None
-        self.highest_price = 0
+
+        if buy_price and current_price:
+            self.record_trade_result(buy_price, current_price)
