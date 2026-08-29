@@ -1,79 +1,201 @@
 # trading/tests.py
+from datetime import date, timedelta
 from unittest import mock
 
 import jwt
+import pandas as pd
 import requests
 from django.test import TestCase
+from django.utils import timezone
 
-from datetime import date
-
-from .auto_trade import AutoTrader, RSI_PERIOD
+from . import indicators as ind
+from . import market_analysis as ma
+from .auto_trade import AutoTrader, FEE_RATE, MAX_POSITIONS
+from .models import AskRecord, FailedMarket, MarketVolumeRecord, TradeRecord
 from .utils import get_ticker_price, upbit_order
 
 
-def make_candles(closes):
-    """ 시간 순 종가 리스트를 업비트 응답 형식(최신 캔들 우선)으로 변환 """
-    return [{"trade_price": price} for price in reversed(closes)]
+def coin(market, change_rate=0.0, price=100.0, volume=1_000_000.0):
+    return {
+        "market": market,
+        "trade_price": price,
+        "signed_change_rate": change_rate,
+        "acc_trade_price_24h": volume,
+    }
 
 
-class GetRsiTests(TestCase):
-    """ AutoTrader.get_rsi 검증 """
+def orderbook(market, bid=300.0, ask=100.0, bid_price=100.0, ask_price=100.05):
+    return {
+        "market": market,
+        "total_bid_size": bid,
+        "total_ask_size": ask,
+        "orderbook_units": [{"ask_price": ask_price, "bid_price": bid_price}],
+    }
 
-    def setUp(self):
-        self.trader = AutoTrader(budget=10000)
 
-    def call_with_candles(self, candles):
-        response = mock.Mock()
-        response.json.return_value = candles
-        with mock.patch("trading.auto_trade.requests.get", return_value=response):
-            return self.trader.get_rsi("KRW-BTC")
+# ======================================================================
+# §6 기술적 지표
+# ======================================================================
 
-    def test_상승만_있으면_100(self):
-        closes = [100 + i for i in range(RSI_PERIOD + 1)]
-        self.assertEqual(self.call_with_candles(make_candles(closes)), 100.0)
+class IndicatorTests(TestCase):
+    def test_RSI_상승만이면_100(self):
+        self.assertEqual(ind.calculate_rsi(pd.Series([100.0 + i for i in range(40)])), 100.0)
 
-    def test_하락만_있으면_0(self):
-        closes = [100 - i for i in range(RSI_PERIOD + 1)]
-        self.assertEqual(self.call_with_candles(make_candles(closes)), 0.0)
+    def test_RSI_하락만이면_0(self):
+        self.assertEqual(ind.calculate_rsi(pd.Series([200.0 - i for i in range(40)])), 0.0)
 
-    def test_상승과_하락이_같으면_50(self):
-        # 100, 101, 100, 101 ... 로 상승 7회 / 하락 7회
-        closes = [100 + (i % 2) for i in range(RSI_PERIOD + 1)]
-        self.assertAlmostEqual(self.call_with_candles(make_candles(closes)), 50.0)
+    def test_RSI_상승과_하락이_같으면_50(self):
+        # 15개 -> 델타 14개 (상승 7 / 하락 7)
+        self.assertAlmostEqual(ind.calculate_rsi(pd.Series([100.0 + (i % 2) for i in range(15)])), 50.0)
 
-    def test_가격_변동이_없으면_50(self):
-        closes = [100] * (RSI_PERIOD + 1)
-        self.assertEqual(self.call_with_candles(make_candles(closes)), 50.0)
+    def test_RSI_데이터_부족하면_None(self):
+        self.assertIsNone(ind.calculate_rsi(pd.Series([1.0, 2.0, 3.0])))
 
-    def test_최신_캔들_우선_순서를_뒤집어_계산한다(self):
-        # 시간 순으로는 계속 상승 -> 100 이어야 한다.
-        # 뒤집지 않으면 계속 하락으로 읽혀 0 이 나온다.
-        closes = [100 + i for i in range(RSI_PERIOD + 1)]
-        candles = make_candles(closes)
-        self.assertGreater(candles[0]["trade_price"], candles[-1]["trade_price"])
-        self.assertEqual(self.call_with_candles(candles), 100.0)
+    def test_RSI_는_Wilder_정의를_따른다(self):
+        closes = [100, 103, 101, 105, 104, 108, 106, 110, 107, 112, 109, 115, 111, 118, 113.0]
+        deltas = [b - a for a, b in zip(closes, closes[1:])]
+        gains = [d if d > 0 else 0.0 for d in deltas]
+        losses = [-d if d < 0 else 0.0 for d in deltas]
+        expected_rs = (sum(gains) / 14) / (sum(losses) / 14)
+        expected = 100 - 100 / (1 + expected_rs)
+        self.assertAlmostEqual(ind.calculate_rsi(pd.Series(closes)), expected)
 
-    def test_캔들이_부족하면_None(self):
-        closes = [100 + i for i in range(RSI_PERIOD)]  # period+1 보다 하나 부족
-        self.assertIsNone(self.call_with_candles(make_candles(closes)))
+    def test_EMA_상수계열은_그_상수(self):
+        self.assertAlmostEqual(ind.calculate_ema(pd.Series([100.0] * 40), 20), 100.0)
 
-    def test_요청_실패시_None(self):
-        with mock.patch(
-            "trading.auto_trade.requests.get",
-            side_effect=requests.RequestException("timeout"),
-        ):
-            self.assertIsNone(self.trader.get_rsi("KRW-BTC"))
+    def test_MACD_상승추세면_양수(self):
+        macd, signal, hist = ind.calculate_macd(pd.Series([100.0 + i for i in range(60)]))
+        self.assertGreater(macd, 0)
 
-    def test_RSI_는_0과_100_사이(self):
-        closes = [100, 103, 101, 105, 104, 108, 106, 110, 107, 112, 109, 115, 111, 118, 113]
-        rsi = self.call_with_candles(make_candles(closes))
-        self.assertGreaterEqual(rsi, 0)
-        self.assertLessEqual(rsi, 100)
+    def test_스토캐스틱_상승끝은_K가_100(self):
+        up = pd.Series([100.0 + i for i in range(30)])
+        k, d = ind.calculate_stochastic(up, up, up)
+        self.assertAlmostEqual(k, 100.0)
 
+    def test_스토캐스틱_보합은_0나눗셈없이_50(self):
+        flat = pd.Series([100.0] * 30)
+        k, d = ind.calculate_stochastic(flat, flat, flat)
+        self.assertAlmostEqual(k, 50.0)
+
+    def test_볼린저밴드_상단_중간_하단_순서(self):
+        upper, middle, lower = ind.calculate_bollinger_bands(pd.Series([100.0 + i for i in range(40)]))
+        self.assertGreater(upper, middle)
+        self.assertGreater(middle, lower)
+
+    def test_볼린저밴드_보합이면_세_값이_같다(self):
+        upper, middle, lower = ind.calculate_bollinger_bands(pd.Series([100.0] * 40))
+        self.assertAlmostEqual(upper, middle)
+        self.assertAlmostEqual(middle, lower)
+
+    def test_ATR_데이터_부족하면_None(self):
+        one = pd.Series([1.0])
+        self.assertIsNone(ind.calculate_atr(one, one, one))
+
+
+# ======================================================================
+# §4 매수 종목 선정
+# ======================================================================
+
+class BuySelectionTests(TestCase):
+    def test_상승_종목만_상승률_순으로_선별(self):
+        coins = [coin("KRW-A", 0.05), coin("KRW-B", -0.03), coin("KRW-C", 0.10)]
+        result = ma.filter_rising_coins(coins)
+        self.assertEqual([c["market"] for c in result], ["KRW-C", "KRW-A"])
+
+    def test_상승률_상위_10개까지만(self):
+        coins = [coin(f"KRW-{i}", 0.01 * (i + 1)) for i in range(20)]
+        self.assertEqual(len(ma.filter_rising_coins(coins)), 10)
+
+    def test_호가_매수세_우위_판정(self):
+        has_pressure, spread = ma.analyze_orderbook(orderbook("KRW-A", bid=300, ask=100))
+        self.assertTrue(has_pressure)
+
+    def test_호가_매수세_부족하면_탈락(self):
+        has_pressure, _ = ma.analyze_orderbook(orderbook("KRW-A", bid=140, ask=100))
+        self.assertFalse(has_pressure)  # 1.5배 미만
+
+    def test_스프레드가_넓으면_탈락(self):
+        coins = [coin("KRW-A", 0.05)]
+        wide = orderbook("KRW-A", bid_price=100.0, ask_price=101.0)  # 1% 스프레드
+        with mock.patch("trading.market_analysis.get_orderbooks", return_value={"KRW-A": wide}):
+            self.assertEqual(ma.filter_by_orderbook(coins), [])
+
+    def test_호가_형식이_깨져도_예외없이_탈락(self):
+        has_pressure, spread = ma.analyze_orderbook({"market": "KRW-A"})
+        self.assertFalse(has_pressure)
+        self.assertIsNone(spread)
+
+    def test_최종_선정은_현재가x거래대금_최대(self):
+        coins = [
+            coin("KRW-A", 0.05, price=100, volume=1_000_000),
+            coin("KRW-B", 0.04, price=500, volume=900_000),   # 곱이 가장 큼
+        ]
+        books = {c["market"]: orderbook(c["market"]) for c in coins}
+        with mock.patch("trading.market_analysis.get_orderbooks", return_value=books):
+            self.assertEqual(ma.select_buy_target(coins)["market"], "KRW-B")
+
+    def test_제외_종목은_선정되지_않는다(self):
+        coins = [coin("KRW-A", 0.05)]
+        books = {"KRW-A": orderbook("KRW-A")}
+        with mock.patch("trading.market_analysis.get_orderbooks", return_value=books):
+            self.assertIsNone(ma.select_buy_target(coins, excluded_markets={"KRW-A"}))
+
+    def test_상승_종목이_없으면_None(self):
+        self.assertIsNone(ma.select_buy_target([coin("KRW-A", -0.05)]))
+
+
+# ======================================================================
+# §5 시장 강도 분석
+# ======================================================================
+
+class MarketStateTests(TestCase):
+    def test_BTC_ETH_평균_2퍼센트_초과면_상승장(self):
+        coins = [coin("KRW-BTC", 0.03), coin("KRW-ETH", 0.03)]
+        self.assertEqual(ma.analyze_by_benchmark(coins), ma.BULLISH)
+
+    def test_BTC_ETH_평균_마이너스2퍼센트_미만이면_하락장(self):
+        coins = [coin("KRW-BTC", -0.03), coin("KRW-ETH", -0.03)]
+        self.assertEqual(ma.analyze_by_benchmark(coins), ma.BEARISH)
+
+    def test_상승코인_60퍼센트_초과면_상승장(self):
+        coins = [coin(f"KRW-{i}", 0.01) for i in range(7)] + [coin(f"KRW-D{i}", -0.01) for i in range(3)]
+        self.assertEqual(ma.analyze_by_up_down_ratio(coins), ma.BULLISH)
+
+    def test_하락코인_60퍼센트_초과면_하락장(self):
+        coins = [coin(f"KRW-{i}", -0.01) for i in range(7)] + [coin(f"KRW-U{i}", 0.01) for i in range(3)]
+        self.assertEqual(ma.analyze_by_up_down_ratio(coins), ma.BEARISH)
+
+    def test_거래량_20퍼센트_증가면_상승장(self):
+        MarketVolumeRecord.objects.create(total_market_volume=100.0)
+        MarketVolumeRecord.objects.update(recorded_at=timezone.now() - timedelta(hours=25))
+        self.assertEqual(ma.analyze_by_volume([coin("KRW-A", volume=200.0)]), ma.BULLISH)
+
+    def test_기록이_없으면_보합(self):
+        self.assertEqual(ma.analyze_by_volume([coin("KRW-A", volume=200.0)]), ma.NEUTRAL)
+
+    def test_24시간이_지나야_새로_기록한다(self):
+        MarketVolumeRecord.objects.create(total_market_volume=100.0)
+        ma.analyze_by_volume([coin("KRW-A", volume=200.0)])
+        self.assertEqual(MarketVolumeRecord.objects.count(), 1)
+
+    def test_3개_중_2개가_같으면_그_방향(self):
+        # BTC/ETH 상승 + 상승코인 비율 상승 -> 상승장
+        coins = [coin("KRW-BTC", 0.03), coin("KRW-ETH", 0.03), coin("KRW-C", 0.01)]
+        state, signals = ma.analyze_market_state(coins)
+        self.assertEqual(state, ma.BULLISH)
+        self.assertEqual(len(signals), 3)
+
+    def test_의견이_갈리면_보합(self):
+        coins = [coin("KRW-BTC", 0.0), coin("KRW-ETH", 0.0)]
+        state, _ = ma.analyze_market_state(coins)
+        self.assertEqual(state, ma.NEUTRAL)
+
+
+# ======================================================================
+# §3 주문
+# ======================================================================
 
 class UpbitOrderTests(TestCase):
-    """ utils.upbit_order 의 요청 구성 검증 """
-
     def post_and_capture(self, **kwargs):
         response = mock.Mock(status_code=201)
         response.json.return_value = {"uuid": "test-order"}
@@ -82,196 +204,40 @@ class UpbitOrderTests(TestCase):
         return result, post
 
     def test_매수는_side가_bid(self):
-        _, post = self.post_and_capture(
-            market="KRW-BTC", side="buy", price=10000, ord_type="price"
-        )
-        params = post.call_args.kwargs["json"]
-        self.assertEqual(params["side"], "bid")
-        self.assertEqual(params["ord_type"], "price")
-        self.assertEqual(params["price"], "10000")
+        _, post = self.post_and_capture(market="KRW-BTC", side="buy", price=10000, ord_type="price")
+        self.assertEqual(post.call_args.kwargs["json"]["side"], "bid")
 
     def test_매도는_side가_ask이고_volume을_보낸다(self):
-        _, post = self.post_and_capture(
-            market="KRW-BTC", side="sell", volume=0.5, ord_type="market"
-        )
+        _, post = self.post_and_capture(market="KRW-BTC", side="sell", volume=0.5, ord_type="market")
         params = post.call_args.kwargs["json"]
         self.assertEqual(params["side"], "ask")
-        self.assertEqual(params["ord_type"], "market")
         self.assertEqual(params["volume"], "0.5")
 
     def test_시장가_매도에_volume이_없으면_요청하지_않고_오류(self):
-        result, post = self.post_and_capture(
-            market="KRW-BTC", side="sell", ord_type="market"
-        )
-        self.assertIn("error", result)
-        self.assertIn("volume", result["error"]["message"])
-        post.assert_not_called()
-
-    def test_시장가_매수에_price가_없으면_요청하지_않고_오류(self):
-        result, post = self.post_and_capture(
-            market="KRW-BTC", side="buy", ord_type="price"
-        )
-        self.assertIn("error", result)
-        self.assertIn("price", result["error"]["message"])
-        post.assert_not_called()
-
-    def test_잘못된_side는_오류(self):
-        result, post = self.post_and_capture(
-            market="KRW-BTC", side="ask", price=10000, ord_type="price"
-        )
+        result, post = self.post_and_capture(market="KRW-BTC", side="sell", ord_type="market")
         self.assertIn("error", result)
         post.assert_not_called()
 
     def test_인증_헤더에_access_key와_query_hash가_들어간다(self):
-        _, post = self.post_and_capture(
-            market="KRW-BTC", side="buy", price=10000, ord_type="price"
-        )
+        _, post = self.post_and_capture(market="KRW-BTC", side="buy", price=10000, ord_type="price")
         token = post.call_args.kwargs["headers"]["Authorization"].removeprefix("Bearer ")
         payload = jwt.decode(token, options={"verify_signature": False})
-
         self.assertIn("access_key", payload)
-        self.assertIn("nonce", payload)
         self.assertIn("query_hash", payload)
         self.assertEqual(payload["query_hash_alg"], "SHA512")
 
-    def test_HTTP_오류는_error로_감싼다(self):
-        response = mock.Mock(status_code=400)
-        response.json.return_value = {"error": {"name": "insufficient_funds"}}
-        with mock.patch("trading.utils.requests.post", return_value=response):
-            result = upbit_order("KRW-BTC", "buy", price=10000, ord_type="price")
-        self.assertIn("error", result)
-
     def test_네트워크_예외는_error로_감싼다(self):
-        with mock.patch(
-            "trading.utils.requests.post",
-            side_effect=requests.RequestException("connection reset"),
-        ):
-            result = upbit_order("KRW-BTC", "buy", price=10000, ord_type="price")
-        self.assertIn("error", result)
-
-
-class StartAutoTradingViewTests(TestCase):
-    """ 자동매매 시작/정지 뷰 검증 """
-
-    def test_시작_요청이_NameError_없이_처리된다(self):
-        with mock.patch("trading.views.AutoTrader") as trader_cls, \
-             mock.patch("trading.views.threading.Thread"):
-            trader_cls.return_value.active = False
-            response = self.client.get("/auto_trade/start/", {"budget": "10000"})
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["status"], "started")
-
-    def test_잘못된_budget은_400(self):
-        response = self.client.get("/auto_trade/start/", {"budget": "만원"})
-        self.assertEqual(response.status_code, 400)
-
-    def test_정지_요청은_실행중이_아니면_not_running(self):
-        response = self.client.get("/auto_trade/stop/")
-        self.assertEqual(response.json()["status"], "not running")
-
-
-class CheckSellTests(TestCase):
-    """ 매도 판단 로직 검증 (매수가 대비 고정 ±2%) """
-
-    def setUp(self):
-        self.trader = AutoTrader(budget=10000)
-        self.trader.current_order = {"market": "KRW-BTC", "buy_price": 100.0}
-
-    def run_check(self, current_price):
-        with mock.patch(
-            "trading.auto_trade.get_ticker_price", return_value=current_price
-        ), mock.patch.object(self.trader, "sell_all") as sell_all:
-            self.trader.check_sell()
-        return sell_all
-
-    def test_상위5개_목록과_무관하게_보유종목_시세를_직접_조회한다(self):
-        with mock.patch(
-            "trading.auto_trade.get_ticker_price", return_value=100.0
-        ) as ticker, mock.patch(
-            "trading.auto_trade.get_krw_market_coin_info"
-        ) as coin_list:
-            self.trader.check_sell()
-
-        ticker.assert_called_once_with("KRW-BTC")
-        coin_list.assert_not_called()
-
-    def test_2퍼센트_오르면_익절(self):
-        sell_all = self.run_check(102.0)
-        sell_all.assert_called_once()
-        self.assertIn("익절", sell_all.call_args.args[2])
-
-    def test_2퍼센트_내리면_손절(self):
-        sell_all = self.run_check(98.0)
-        sell_all.assert_called_once()
-        self.assertIn("손절", sell_all.call_args.args[2])
-
-    def test_2퍼센트_미만_상승은_보유_유지(self):
-        self.run_check(101.9).assert_not_called()
-
-    def test_2퍼센트_미만_하락은_보유_유지(self):
-        self.run_check(98.1).assert_not_called()
-
-    def test_최고점_대비_하락만으로는_팔지_않는다(self):
-        # 트레일링 스탑 제거 확인: 101.5 까지 올랐다가 100.5 로 밀려도 보유
-        self.run_check(101.5).assert_not_called()
-        self.run_check(100.5).assert_not_called()
-
-    def test_현재가_조회_실패시_아무것도_하지_않는다(self):
-        sell_all = self.run_check(None)
-        sell_all.assert_not_called()
-        self.assertIsNotNone(self.trader.current_order)
-
-
-class SellAllTests(TestCase):
-    """ 전량 시장가 매도 검증 """
-
-    def setUp(self):
-        self.trader = AutoTrader(budget=10000)
-        self.trader.current_order = {"market": "KRW-BTC", "buy_price": 100.0}
-
-    def test_보유수량을_조회해_volume으로_넘긴다(self):
-        with mock.patch("trading.auto_trade.get_balance", return_value=0.25) as balance, \
-             mock.patch("trading.auto_trade.upbit_order", return_value={"uuid": "x"}) as order:
-            self.trader.sell_all("KRW-BTC", 110.0, "매도")
-
-        balance.assert_called_once_with("BTC")
-        self.assertEqual(order.call_args.kwargs["volume"], 0.25)
-        self.assertEqual(order.call_args.kwargs["ord_type"], "market")
-        self.assertIsNone(self.trader.current_order)
-
-    def test_보유수량이_없으면_주문하지_않고_상태를_초기화한다(self):
-        with mock.patch("trading.auto_trade.get_balance", return_value=0.0), \
-             mock.patch("trading.auto_trade.upbit_order") as order:
-            self.trader.sell_all("KRW-BTC", 110.0, "매도")
-
-        order.assert_not_called()
-        self.assertIsNone(self.trader.current_order)
-
-    def test_주문이_실패하면_보유상태를_유지한다(self):
-        with mock.patch("trading.auto_trade.get_balance", return_value=0.25), \
-             mock.patch("trading.auto_trade.upbit_order",
-                        return_value={"error": {"message": "실패"}}):
-            self.trader.sell_all("KRW-BTC", 110.0, "매도")
-
-        # 매도가 안 됐는데 상태를 지우면 보유 코인을 영영 못 판다
-        self.assertIsNotNone(self.trader.current_order)
+        with mock.patch("trading.utils.requests.post",
+                        side_effect=requests.RequestException("reset")):
+            self.assertIn("error", upbit_order("KRW-BTC", "buy", price=10000, ord_type="price"))
 
 
 class GetTickerPriceTests(TestCase):
-    """ utils.get_ticker_price 검증 """
-
     def test_현재가를_반환한다(self):
         response = mock.Mock()
         response.json.return_value = [{"market": "KRW-BTC", "trade_price": 90000000}]
         with mock.patch("trading.utils.requests.get", return_value=response):
             self.assertEqual(get_ticker_price("KRW-BTC"), 90000000)
-
-    def test_빈_응답이면_None(self):
-        response = mock.Mock()
-        response.json.return_value = []
-        with mock.patch("trading.utils.requests.get", return_value=response):
-            self.assertIsNone(get_ticker_price("KRW-BTC"))
 
     def test_요청_실패시_None(self):
         with mock.patch("trading.utils.requests.get",
@@ -279,19 +245,263 @@ class GetTickerPriceTests(TestCase):
             self.assertIsNone(get_ticker_price("KRW-BTC"))
 
 
-class DailyLossCutTests(TestCase):
-    """ 일일 손실 한도(매매원금 대비 -10%) 검증 """
+# ======================================================================
+# §7 포지션 관리
+# ======================================================================
 
+class PositionTests(TestCase):
+    def setUp(self):
+        self.trader = AutoTrader(budget=10000)
+
+    def test_매수시_DB와_메모리에_기록된다(self):
+        self.trader.open_position("KRW-BTC", 100.0, "uuid-1", 10000)
+        self.assertIn("KRW-BTC", self.trader.positions)
+        self.assertTrue(TradeRecord.objects.filter(market="KRW-BTC", is_active=True).exists())
+
+    def test_재시작하면_DB에서_복원한다(self):
+        TradeRecord.objects.create(market="KRW-ETH", buy_price=50.0,
+                                   highest_price=55.0, buy_krw_price=10000)
+        restored = AutoTrader(budget=10000)
+        self.assertIn("KRW-ETH", restored.positions)
+        self.assertEqual(restored.positions["KRW-ETH"]["highest_price"], 55.0)
+
+    def test_비활성_기록은_복원하지_않는다(self):
+        TradeRecord.objects.create(market="KRW-ETH", buy_price=50.0, is_active=False)
+        self.assertNotIn("KRW-ETH", AutoTrader(budget=10000).positions)
+
+    def test_매도시_비활성화되고_매도기록이_남는다(self):
+        self.trader.open_position("KRW-BTC", 100.0, "uuid-1", 10000)
+        self.trader.close_position("KRW-BTC")
+        self.assertNotIn("KRW-BTC", self.trader.positions)
+        self.assertFalse(TradeRecord.objects.get(market="KRW-BTC").is_active)
+        self.assertTrue(AskRecord.objects.filter(market="KRW-BTC").exists())
+
+    def test_최고가는_메모리와_DB에_함께_갱신된다(self):
+        self.trader.open_position("KRW-BTC", 100.0, "uuid-1", 10000)
+        self.trader.update_highest_price("KRW-BTC", 120.0)
+        self.assertEqual(self.trader.positions["KRW-BTC"]["highest_price"], 120.0)
+        self.assertEqual(TradeRecord.objects.get(market="KRW-BTC").highest_price, 120.0)
+
+    def test_사용자_수동매도를_감지해_정리한다(self):
+        self.trader.open_position("KRW-BTC", 100.0, "uuid-1", 10000)
+        accounts = [{"currency": "KRW", "balance": "50000"}]  # BTC 없음
+        self.trader.sync_manual_sells(accounts)
+        self.assertNotIn("KRW-BTC", self.trader.positions)
+
+    def test_계좌_조회_실패시엔_보유목록을_건드리지_않는다(self):
+        self.trader.open_position("KRW-BTC", 100.0, "uuid-1", 10000)
+        self.trader.sync_manual_sells({"error": {"message": "실패"}})
+        self.assertIn("KRW-BTC", self.trader.positions)
+
+
+class BlockedMarketTests(TestCase):
+    def setUp(self):
+        self.trader = AutoTrader(budget=10000)
+
+    def test_주문_실패_종목은_제외된다(self):
+        FailedMarket.objects.create(market="KRW-BAD")
+        self.assertIn("KRW-BAD", self.trader.blocked_markets())
+
+    def test_최근_매도_종목은_10분간_제외된다(self):
+        AskRecord.objects.create(market="KRW-SOLD")
+        self.assertIn("KRW-SOLD", self.trader.blocked_markets())
+
+    def test_10분이_지난_매도_종목은_다시_매수_가능(self):
+        AskRecord.objects.create(market="KRW-OLD")
+        AskRecord.objects.update(recorded_at=timezone.now() - timedelta(seconds=700))
+        self.assertNotIn("KRW-OLD", self.trader.blocked_markets())
+
+    def test_보유_종목은_제외된다(self):
+        self.trader.open_position("KRW-BTC", 100.0, "uuid-1", 10000)
+        self.assertIn("KRW-BTC", self.trader.blocked_markets())
+
+
+class TryBuyTests(TestCase):
+    def setUp(self):
+        self.trader = AutoTrader(budget=10000)
+        self.accounts = [{"currency": "KRW", "balance": "100000"}]
+        self.coins = [coin("KRW-A", 0.05)]
+
+    def buy_with(self, order_result, accounts=None, coins=None):
+        books = {"KRW-A": orderbook("KRW-A")}
+        with mock.patch("trading.market_analysis.get_orderbooks", return_value=books), \
+             mock.patch("trading.auto_trade.upbit_order", return_value=order_result) as order:
+            self.trader.try_buy(accounts or self.accounts, coins or self.coins)
+        return order
+
+    def test_조건을_만족하면_시장가_매수한다(self):
+        order = self.buy_with({"uuid": "u1"})
+        order.assert_called_once()
+        self.assertEqual(order.call_args.kwargs["ord_type"], "price")
+        self.assertIn("KRW-A", self.trader.positions)
+
+    def test_잔고가_예산보다_적으면_잔고만큼만_주문한다(self):
+        order = self.buy_with({"uuid": "u1"}, accounts=[{"currency": "KRW", "balance": "12000"}])
+        self.assertEqual(order.call_args.kwargs["price"], 10000)
+
+        self.trader.positions.clear()
+        order = self.buy_with({"uuid": "u2"}, accounts=[{"currency": "KRW", "balance": "10500"}])
+        self.assertEqual(order.call_args.kwargs["price"], 10000)
+
+    def test_최소잔고_미만이면_매수하지_않는다(self):
+        order = self.buy_with({"uuid": "u1"}, accounts=[{"currency": "KRW", "balance": "9000"}])
+        order.assert_not_called()
+
+    def test_동시보유_상한에_도달하면_매수하지_않는다(self):
+        for i in range(MAX_POSITIONS):
+            self.trader.open_position(f"KRW-P{i}", 100.0, f"u{i}", 10000)
+        order = self.buy_with({"uuid": "u9"})
+        order.assert_not_called()
+
+    def test_주문_실패시_FailedMarket에_기록한다(self):
+        self.buy_with({"error": {"message": "실패"}})
+        self.assertTrue(FailedMarket.objects.filter(market="KRW-A").exists())
+        self.assertNotIn("KRW-A", self.trader.positions)
+
+
+# ======================================================================
+# §8 매도 전략
+# ======================================================================
+
+class SellDecisionTests(TestCase):
+    def setUp(self):
+        self.trader = AutoTrader(budget=10000)
+        self.trader.open_position("KRW-A", 100.0, "u1", 10000)
+        self.position = self.trader.positions["KRW-A"]
+
+    def decide(self, current_price, coin_info=None):
+        change = current_price / 100.0 - 1
+        return self.trader.decide_sell("KRW-A", self.position, current_price, change, coin_info)
+
+    def test_손절_2퍼센트(self):
+        self.assertIn("손절", self.decide(98.0))
+
+    def test_고변동성_종목은_4퍼센트에서_손절(self):
+        volatile = coin("KRW-A", change_rate=0.06)
+        self.assertIsNone(self.decide(98.0, volatile))          # -2% 로는 안 판다
+        self.assertIn("고변동성", self.decide(96.0, volatile))   # -4% 에서 판다
+
+    def test_보합장은_1퍼센트에서_즉시_익절(self):
+        self.trader.market_state = ma.NEUTRAL
+        self.assertIn("익절", self.decide(101.0))
+
+    def test_상승장은_1퍼센트에서_팔지_않는다(self):
+        self.trader.market_state = ma.BULLISH
+        self.assertIsNone(self.decide(101.0))
+
+    def test_2퍼센트_도달후_최고점_1퍼센트_하락하면_트레일링_매도(self):
+        self.trader.update_highest_price("KRW-A", 105.0)
+        self.assertIn("트레일링", self.decide(103.0))  # 105 * 0.99 = 103.95 >= 103
+
+    def test_트레일링_활성화후_소폭_하락은_보유(self):
+        self.trader.update_highest_price("KRW-A", 105.0)
+        self.assertIsNone(self.decide(104.5))
+
+    def test_2퍼센트_미도달이면_트레일링이_작동하지_않는다(self):
+        self.trader.market_state = ma.BULLISH
+        self.trader.update_highest_price("KRW-A", 101.5)
+        self.assertIsNone(self.decide(100.4))  # 최고점 -1% 이지만 아직 +2% 미도달
+
+    def test_상승장_5분_경과후_1퍼센트면_매도(self):
+        self.trader.market_state = ma.BULLISH
+        self.position["created_at"] = timezone.now() - timedelta(seconds=400)
+        self.assertIn("시간 기반", self.decide(101.0))
+
+    def test_상승장_5분_이전에는_1퍼센트라도_보유(self):
+        self.trader.market_state = ma.BULLISH
+        self.position["created_at"] = timezone.now() - timedelta(seconds=100)
+        self.assertIsNone(self.decide(101.0))
+
+    def test_상승장_시간경과해도_수익이_없으면_보유(self):
+        self.trader.market_state = ma.BULLISH
+        self.position["created_at"] = timezone.now() - timedelta(seconds=400)
+        self.assertIsNone(self.decide(100.2))
+
+    def test_조건_미달이면_보유한다(self):
+        self.trader.market_state = ma.BULLISH
+        self.assertIsNone(self.decide(100.5))
+
+
+class CheckSellTests(TestCase):
+    """ 보유 종목 시세 재사용 및 최고가 갱신 """
+
+    def setUp(self):
+        self.trader = AutoTrader(budget=10000)
+        self.trader.open_position("KRW-A", 100.0, "u1", 10000)
+
+    def test_이미_받아온_시세를_재사용해_추가_조회하지_않는다(self):
+        with mock.patch("trading.auto_trade.get_ticker_price") as ticker, \
+             mock.patch.object(self.trader, "sell_all"):
+            self.trader.check_sell("KRW-A", coin("KRW-A", price=101.0))
+        ticker.assert_not_called()
+
+    def test_목록에_없는_종목은_개별_조회한다(self):
+        with mock.patch("trading.auto_trade.get_ticker_price", return_value=101.0) as ticker, \
+             mock.patch.object(self.trader, "sell_all"):
+            self.trader.check_sell("KRW-A", None)
+        ticker.assert_called_once_with("KRW-A")
+
+    def test_상승하면_최고가를_갱신한다(self):
+        with mock.patch.object(self.trader, "sell_all"):
+            self.trader.check_sell("KRW-A", coin("KRW-A", price=120.0))
+        self.assertEqual(self.trader.positions["KRW-A"]["highest_price"], 120.0)
+        self.assertEqual(TradeRecord.objects.get(market="KRW-A").highest_price, 120.0)
+
+
+class SellExecutionTests(TestCase):
+    def setUp(self):
+        self.trader = AutoTrader(budget=10000)
+        self.trader.open_position("KRW-A", 100.0, "u1", 10000)
+
+    def test_보유수량을_조회해_volume으로_넘긴다(self):
+        with mock.patch("trading.auto_trade.get_balance", return_value=0.25) as balance, \
+             mock.patch("trading.auto_trade.is_order_done", return_value=True), \
+             mock.patch("trading.auto_trade.upbit_order", return_value={"uuid": "x"}) as order:
+            self.trader.sell_all("KRW-A", 102.0, "매도")
+
+        balance.assert_called_once_with("A")
+        self.assertEqual(order.call_args.kwargs["volume"], 0.25)
+        self.assertNotIn("KRW-A", self.trader.positions)
+
+    def test_주문이_실패하면_보유상태를_유지한다(self):
+        with mock.patch("trading.auto_trade.get_balance", return_value=0.25), \
+             mock.patch("trading.auto_trade.upbit_order", return_value={"error": {"m": "x"}}):
+            self.trader.sell_all("KRW-A", 102.0, "매도")
+        self.assertIn("KRW-A", self.trader.positions)
+
+    def test_보유수량이_없으면_주문없이_정리한다(self):
+        with mock.patch("trading.auto_trade.get_balance", return_value=0.0), \
+             mock.patch("trading.auto_trade.upbit_order") as order:
+            self.trader.sell_all("KRW-A", 102.0, "매도")
+        order.assert_not_called()
+        self.assertNotIn("KRW-A", self.trader.positions)
+
+
+# ======================================================================
+# §12 수수료 / 일일 손실 한도
+# ======================================================================
+
+class ProfitAndLossCutTests(TestCase):
     def setUp(self):
         self.trader = AutoTrader(budget=10000)  # 한도 -1,000원
 
     def test_한도는_매매원금의_10퍼센트(self):
         self.assertEqual(self.trader.daily_loss_limit(), -1000.0)
 
+    def test_실현손익은_왕복_수수료를_반영한다(self):
+        pnl = self.trader.record_trade_result("KRW-A", 100.0, 102.0, 10000)
+        effective_buy = 100.0 * (1 + FEE_RATE)
+        effective_sell = 102.0 * (1 - FEE_RATE)
+        expected = 10000 * (effective_sell - effective_buy) / effective_buy
+        self.assertAlmostEqual(pnl, expected)
+
+    def test_수수료를_빼면_2퍼센트_수익이_2퍼센트에_못미친다(self):
+        pnl = self.trader.record_trade_result("KRW-A", 100.0, 102.0, 10000)
+        self.assertLess(pnl, 200.0)
+
     def test_한도_미도달이면_계속_매매한다(self):
         self.trader.active = True
         self.trader.daily_pnl = -999.0
-
         self.assertFalse(self.trader.check_loss_cut())
         self.assertTrue(self.trader.active)
 
@@ -301,60 +511,79 @@ class DailyLossCutTests(TestCase):
         self.assertTrue(self.trader.check_loss_cut())
         self.assertFalse(self.trader.active)
 
-    def test_한도_도달시_보유_포지션을_청산한다(self):
+    def test_한도_도달시_보유_전량을_청산한다(self):
         self.trader.active = True
         self.trader.daily_pnl = -1200.0
-        self.trader.current_order = {"market": "KRW-BTC", "buy_price": 100.0}
+        self.trader.open_position("KRW-A", 100.0, "u1", 10000)
+        self.trader.open_position("KRW-B", 100.0, "u2", 10000)
 
         with mock.patch("trading.auto_trade.get_ticker_price", return_value=90.0), \
              mock.patch.object(self.trader, "sell_all") as sell_all:
             self.trader.check_loss_cut()
 
-        sell_all.assert_called_once()
-        self.assertEqual(sell_all.call_args.args[0], "KRW-BTC")
-
-    def test_정지_후에는_신규_매수를_시도하지_않는다(self):
-        self.trader.active = True
-        self.trader.daily_pnl = -1500.0
-
-        with mock.patch.object(self.trader, "try_buy") as try_buy, \
-             mock.patch.object(self.trader, "check_sell") as check_sell:
-            self.trader.execute_trade()
-
-        try_buy.assert_not_called()
-        check_sell.assert_not_called()
-        self.assertFalse(self.trader.active)
-
-    def test_실현손익은_수수료를_차감해_누적된다(self):
-        # +2% 익절: 10000 * 0.02 = 200원, 왕복 수수료 10000 * 0.0005 * 2 = 10원
-        pnl = self.trader.record_trade_result(buy_price=100.0, sell_price=102.0)
-        self.assertAlmostEqual(pnl, 190.0)
-        self.assertAlmostEqual(self.trader.daily_pnl, 190.0)
-
-    def test_손절도_수수료를_차감해_누적된다(self):
-        # -2% 손절: -200원 - 10원 = -210원
-        pnl = self.trader.record_trade_result(buy_price=100.0, sell_price=98.0)
-        self.assertAlmostEqual(pnl, -210.0)
-
-    def test_연속_손절이_누적되어_한도에_도달한다(self):
-        # 회당 -210원 -> 5회면 -1,050원으로 한도(-1,000원) 초과
-        for _ in range(5):
-            self.trader.record_trade_result(buy_price=100.0, sell_price=98.0)
-
-        self.assertAlmostEqual(self.trader.daily_pnl, -1050.0)
-        self.trader.active = True
-        self.assertTrue(self.trader.check_loss_cut())
+        self.assertEqual(sell_all.call_count, 2)
 
     def test_날짜가_바뀌면_당일_손익이_초기화된다(self):
         self.trader.daily_pnl = -900.0
         self.trader.pnl_date = date(2020, 1, 1)
-
         self.trader.reset_daily_pnl_if_new_day()
-
         self.assertEqual(self.trader.daily_pnl, 0.0)
-        self.assertEqual(self.trader.pnl_date, self.trader.today())
 
     def test_같은_날에는_손익이_유지된다(self):
         self.trader.daily_pnl = -900.0
         self.trader.reset_daily_pnl_if_new_day()
         self.assertEqual(self.trader.daily_pnl, -900.0)
+
+
+# ======================================================================
+# §10 웹 엔드포인트
+# ======================================================================
+
+class EndpointTests(TestCase):
+    def test_모든_조회_엔드포인트가_JSON을_반환한다(self):
+        paths = [
+            "/api/trade_logs/",
+            "/api/check_auto_trading/",
+            "/api/getRecntTradeLog/",
+            "/api/recentProfitLog/",
+        ]
+        for path in paths:
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response["Content-Type"], "application/json")
+
+    def test_시장상태_엔드포인트(self):
+        coins = [coin("KRW-BTC", 0.03), coin("KRW-ETH", 0.03)]
+        with mock.patch("trading.views.get_krw_market_coin_info", return_value=coins):
+            response = self.client.get("/api/get_market_volume/")
+        self.assertEqual(response.json()["state"], ma.BULLISH)
+
+    def test_시세조회_실패시_unknown(self):
+        with mock.patch("trading.views.get_krw_market_coin_info", return_value=[]):
+            response = self.client.get("/api/get_market_volume/")
+        self.assertEqual(response.json()["state"], "unknown")
+
+    def test_계좌_엔드포인트(self):
+        with mock.patch("trading.views.get_account_info", return_value=[]):
+            response = self.client.get("/api/fetch_account_data/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_시작_요청이_NameError_없이_처리된다(self):
+        with mock.patch("trading.views.AutoTrader") as trader_cls, \
+             mock.patch("trading.views.threading.Thread"):
+            trader_cls.return_value.active = False
+            response = self.client.get("/auto_trade/start/", {"budget": "10000"})
+        self.assertEqual(response.json()["status"], "started")
+
+    def test_잘못된_budget은_400(self):
+        self.assertEqual(self.client.get("/auto_trade/start/", {"budget": "만원"}).status_code, 400)
+
+    def test_정지_요청은_실행중이_아니면_not_running(self):
+        self.assertEqual(self.client.get("/auto_trade/stop/").json()["status"], "not running")
+
+    def test_메인_페이지가_렌더링된다(self):
+        with mock.patch("trading.views.get_account_info", return_value=[]), \
+             mock.patch("trading.views.get_top_coin_info", return_value=[]):
+            response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)

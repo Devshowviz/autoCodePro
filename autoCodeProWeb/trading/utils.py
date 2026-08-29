@@ -1,9 +1,11 @@
 # trading/utils.py
 import hashlib
+import time
 import uuid
 from urllib.parse import urlencode
 
 import jwt
+import pandas as pd
 import requests
 from django.conf import settings
 
@@ -12,6 +14,13 @@ REQUEST_TIMEOUT = 5  # 초
 
 # 업비트 주문 API 의 side 값 (bid: 매수, ask: 매도)
 ORDER_SIDES = {"buy": "bid", "sell": "ask"}
+
+# 호가는 한 번에 여러 종목을 조회할 수 있으나, 429 를 피하려고 나눠 보낸다.
+ORDERBOOK_BATCH_SIZE = 10
+ORDERBOOK_CACHE_TTL = 5  # 초
+
+# {market: (조회시각, 호가 dict)}
+_orderbook_cache = {}
 
 
 def _safe_json(response):
@@ -41,6 +50,10 @@ def _auth_headers(params=None):
     jwt_token = jwt.encode(payload, settings.UPBIT_SECRET_KEY, algorithm="HS256")
     return {"Authorization": f"Bearer {jwt_token}"}
 
+
+# ----------------------------------------------------------------------
+# 계좌
+# ----------------------------------------------------------------------
 
 def get_account_info():
     """ 업비트 전체 계좌 조회 API 호출 """
@@ -77,30 +90,35 @@ def get_balance(currency):
     return 0.0
 
 
-def get_ticker_price(market):
-    """ 특정 마켓의 현재가 조회. 실패 시 None
+def get_held_currencies(accounts=None):
+    """ 실제로 보유 중인 코인 화폐 코드 집합 (KRW 제외)
 
-    보유 종목은 거래대금 상위 5개 밖으로 밀려날 수 있으므로,
-    목록에 의존하지 않고 해당 마켓을 직접 조회한다.
+    사용자가 업비트 앱에서 직접 매도한 경우를 감지하는 데 쓴다.
     """
-    try:
-        response = requests.get(
-            f"{UPBIT_API_URL}/v1/ticker",
-            params={"markets": market},
-            timeout=REQUEST_TIMEOUT,
-        )
-        tickers = response.json()
-    except (requests.RequestException, ValueError):
-        return None
+    if accounts is None:
+        accounts = get_account_info()
+    if not isinstance(accounts, list):
+        return None  # 조회 실패는 "보유 없음" 과 구분해야 한다
 
-    if not isinstance(tickers, list) or not tickers:
-        return None
+    held = set()
+    for account in accounts:
+        currency = account.get("currency")
+        if currency == "KRW":
+            continue
+        try:
+            if float(account.get("balance", 0)) > 0:
+                held.add(currency)
+        except (TypeError, ValueError):
+            continue
+    return held
 
-    return tickers[0].get("trade_price")
 
+# ----------------------------------------------------------------------
+# 시세
+# ----------------------------------------------------------------------
 
 def get_krw_market_coin_info():
-    """ KRW 마켓에서 거래대금 상위 5개 코인 조회. 실패 시 빈 리스트 """
+    """ KRW 마켓 전 종목 시세를 24시간 거래대금 내림차순으로 반환. 실패 시 빈 리스트 """
     try:
         markets_response = requests.get(
             f"{UPBIT_API_URL}/v1/market/all", timeout=REQUEST_TIMEOUT
@@ -117,19 +135,118 @@ def get_krw_market_coin_info():
     except (requests.RequestException, ValueError, TypeError, KeyError):
         return []
 
+    if not isinstance(ticker_response, list):
+        return []
+
     coin_info_list = [{
         "market": ticker["market"],
         "trade_price": ticker["trade_price"],
+        "high_price": ticker.get("high_price"),
+        "low_price": ticker.get("low_price"),
+        "trade_volume": ticker.get("trade_volume"),
         "signed_change_rate": ticker["signed_change_rate"],
         "acc_trade_price_24h": ticker["acc_trade_price_24h"],
+        "acc_trade_volume_24h": ticker.get("acc_trade_volume_24h"),
     } for ticker in ticker_response]
 
-    return sorted(
-        coin_info_list,
-        key=lambda x: (x["acc_trade_price_24h"], x["signed_change_rate"]),
-        reverse=True,
-    )[:5]
+    return sorted(coin_info_list, key=lambda x: x["acc_trade_price_24h"], reverse=True)
 
+
+def get_top_coin_info(limit=5):
+    """ 대시보드 표시용 상위 종목 """
+    return get_krw_market_coin_info()[:limit]
+
+
+def get_ticker_price(market):
+    """ 특정 마켓의 현재가 조회. 실패 시 None """
+    try:
+        response = requests.get(
+            f"{UPBIT_API_URL}/v1/ticker",
+            params={"markets": market},
+            timeout=REQUEST_TIMEOUT,
+        )
+        tickers = response.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+    if not isinstance(tickers, list) or not tickers:
+        return None
+
+    return tickers[0].get("trade_price")
+
+
+def get_orderbooks(markets):
+    """ 여러 종목의 호가를 배치로 조회. {market: 호가} 반환
+
+    5초 캐시를 두어 같은 종목을 반복 조회하지 않는다 (429 방지).
+    """
+    now = time.time()
+    result = {}
+    to_fetch = []
+
+    for market in markets:
+        cached = _orderbook_cache.get(market)
+        if cached and now - cached[0] < ORDERBOOK_CACHE_TTL:
+            result[market] = cached[1]
+        else:
+            to_fetch.append(market)
+
+    for start in range(0, len(to_fetch), ORDERBOOK_BATCH_SIZE):
+        batch = to_fetch[start:start + ORDERBOOK_BATCH_SIZE]
+        try:
+            response = requests.get(
+                f"{UPBIT_API_URL}/v1/orderbook",
+                params={"markets": ",".join(batch)},
+                timeout=REQUEST_TIMEOUT,
+            )
+            orderbooks = response.json()
+        except (requests.RequestException, ValueError):
+            continue
+
+        if not isinstance(orderbooks, list):
+            continue
+
+        for orderbook in orderbooks:
+            market = orderbook.get("market")
+            if not market:
+                continue
+            _orderbook_cache[market] = (now, orderbook)
+            result[market] = orderbook
+
+    return result
+
+
+def get_candles(market, count=200):
+    """ 초봉 데이터를 DataFrame(close/high/low)으로 반환. 실패 시 None """
+    try:
+        response = requests.get(
+            f"{UPBIT_API_URL}/v1/candles/seconds",
+            params={"market": market, "count": count},
+            timeout=REQUEST_TIMEOUT,
+        )
+        candles = response.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+    if not isinstance(candles, list) or not candles:
+        return None
+
+    # 업비트는 최신 캔들부터 반환하므로 시간 순서대로 뒤집는다
+    candles = list(reversed(candles))
+
+    try:
+        return pd.DataFrame({
+            "close": [float(c["trade_price"]) for c in candles],
+            "high": [float(c["high_price"]) for c in candles],
+            "low": [float(c["low_price"]) for c in candles],
+        })
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+# ----------------------------------------------------------------------
+# 주문
+# ----------------------------------------------------------------------
 
 def upbit_order(market, side, volume=None, price=None, ord_type="limit"):
     """ 업비트 주문 API 호출 (매수/매도)
@@ -176,3 +293,31 @@ def upbit_order(market, side, volume=None, price=None, ord_type="limit"):
         return {"error": _safe_json(response)}
 
     return _safe_json(response)
+
+
+def get_order(order_uuid):
+    """ 주문 UUID 로 주문 상태 조회 """
+    params = {"uuid": order_uuid}
+
+    try:
+        response = requests.get(
+            f"{UPBIT_API_URL}/v1/order",
+            params=params,
+            headers=_auth_headers(params),
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        return {"error": {"message": f"주문 조회 실패: {e}"}}
+
+    if response.status_code != 200:
+        return {"error": _safe_json(response)}
+
+    return _safe_json(response)
+
+
+def is_order_done(order_uuid):
+    """ 주문이 체결 완료(state=done)되었는지 확인 """
+    if not order_uuid:
+        return False
+    order = get_order(order_uuid)
+    return isinstance(order, dict) and order.get("state") == "done"
