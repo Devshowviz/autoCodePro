@@ -5,7 +5,8 @@ from .utils import get_account_info, get_krw_market_coin_info, upbit_order
 from .auto_trade import AutoTrader, trade_logs
 import threading
 
-auto_trading = False
+# 실행 중인 트레이더. 선언이 없으면 start/stop 에서 NameError 가 난다.
+trader = None
 
 def main_view(request):
     """ 메인 페이지 """
@@ -29,11 +30,19 @@ def fetch_trade_logs(request):
 def start_auto_trading(request):
     """ 자동매매 시작 """
     global trader
-    budget = int(request.GET.get("budget", 10000))
+
+    try:
+        budget = int(request.GET.get("budget", 10000))
+    except (TypeError, ValueError):
+        return JsonResponse({"status": "error", "message": "budget 값이 올바르지 않습니다"}, status=400)
+
+    if budget <= 0:
+        return JsonResponse({"status": "error", "message": "budget 은 0보다 커야 합니다"}, status=400)
 
     if trader is None or not trader.active:
         trader = AutoTrader(budget)
-        threading.Thread(target=trader.start_trading).start()
+        # 서버 종료를 막지 않도록 데몬 스레드로 실행
+        threading.Thread(target=trader.start_trading, daemon=True).start()
         return JsonResponse({"status": "started"})
 
     return JsonResponse({"status": "already running"})

@@ -179,9 +179,10 @@
             });
     }
 
-    setInterval(updateAccountData, 200);
-    setInterval(updateCoinData, 200);
-    setInterval(updateTradeLogs, 200);  // 1초마다 로그 갱신
+    // 업비트 API 요청 제한에 걸리지 않도록 1초 주기로 갱신한다
+    setInterval(updateAccountData, 1000);
+    setInterval(updateCoinData, 1000);
+    setInterval(updateTradeLogs, 1000);  // 1초마다 로그 갱신
 </script>
 
 </body>
