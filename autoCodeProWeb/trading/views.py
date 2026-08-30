@@ -34,7 +34,8 @@ def fetch_coin_data(request):
 
 def fetch_trade_logs(request):
     """ ✅ AJAX 요청을 받아 자동매매 로그 반환 """
-    return JsonResponse({"logs": trade_logs})
+    # 매매 스레드가 동시에 수정할 수 있으므로 사본을 직렬화한다
+    return JsonResponse({"logs": trade_logs[:]})
 
 
 def check_auto_trading(request):
@@ -42,7 +43,7 @@ def check_auto_trading(request):
     running = trader is not None and trader.active
     return JsonResponse({
         "running": running,
-        "positions": list(trader.positions) if trader else [],
+        "positions": trader.positions_snapshot() if trader else [],
         "daily_pnl": round(trader.daily_pnl) if trader else 0,
         "daily_loss_limit": round(trader.daily_loss_limit()) if trader else 0,
     })
@@ -76,7 +77,7 @@ def recent_trade_log(request):
 
 def recent_profit_log(request):
     """ 최근 수익 로그 (매수가/매도가/수익률) """
-    return JsonResponse({"profits": list(reversed(profit_logs))})
+    return JsonResponse({"profits": profit_logs[::-1]})
 
 
 def start_auto_trading(request):
@@ -93,6 +94,19 @@ def start_auto_trading(request):
 
     if trader is None or not trader.active:
         trader = AutoTrader(budget)
+
+        # 당일 누적 손익은 DB 에서 복원되므로, 이미 한도를 넘긴 날에는
+        # 재시작으로 로스컷을 우회할 수 없다
+        if trader.daily_pnl <= trader.daily_loss_limit():
+            return JsonResponse({
+                "status": "loss_cut",
+                "message": (
+                    f"당일 손실 한도 도달 상태입니다 "
+                    f"(누적 {trader.daily_pnl:+,.0f}원 / 한도 {trader.daily_loss_limit():,.0f}원). "
+                    f"다음 날(KST)까지 자동매매를 시작할 수 없습니다."
+                ),
+            })
+
         # 서버 종료를 막지 않도록 데몬 스레드로 실행
         trader_thread = threading.Thread(target=trader.start_trading, daemon=True)
         trader_thread.start()

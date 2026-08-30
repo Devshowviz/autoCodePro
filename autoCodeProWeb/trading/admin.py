@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import AskRecord, FailedMarket, MarketVolumeRecord, TradeRecord
+from .models import AskRecord, DailyPnlRecord, FailedMarket, MarketVolumeRecord, TradeRecord
 
 
 @admin.register(TradeRecord)
@@ -25,3 +25,8 @@ class MarketVolumeRecordAdmin(admin.ModelAdmin):
 class AskRecordAdmin(admin.ModelAdmin):
     list_display = ("market", "recorded_at")
     search_fields = ("market",)
+
+
+@admin.register(DailyPnlRecord)
+class DailyPnlRecordAdmin(admin.ModelAdmin):
+    list_display = ("date", "realized_pnl")

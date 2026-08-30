@@ -61,3 +61,17 @@ class AskRecord(models.Model):
 
     def __str__(self):
         return f"{self.market} @ {self.recorded_at:%Y-%m-%d %H:%M}"
+
+
+class DailyPnlRecord(models.Model):
+    """ 당일 누적 실현손익. 서버 재시작 후에도 일일 손실 한도가 유지되도록 DB 에 기록한다. """
+
+    date = models.DateField(unique=True)          # KST 기준 날짜
+    realized_pnl = models.FloatField(default=0)   # 당일 누적 실현손익(원)
+
+    class Meta:
+        verbose_name = "일일 실현손익"
+        verbose_name_plural = "일일 실현손익"
+
+    def __str__(self):
+        return f"{self.date} / {self.realized_pnl:+,.0f}원"

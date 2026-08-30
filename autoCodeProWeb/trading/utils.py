@@ -73,19 +73,24 @@ def get_account_info():
 
 
 def get_balance(currency):
-    """ 특정 화폐(KRW, BTC 등)의 보유 수량 조회. 조회 실패 시 0.0 """
+    """ 특정 화폐(KRW, BTC 등)의 보유 수량 조회
+
+    조회 실패는 None, 실제로 없는 것은 0.0 을 돌려준다.
+    이 둘을 구분하지 않으면 API 가 잠깐 실패했을 때 보유 코인을
+    "없다" 고 판단해 매도 없이 포지션을 정리해 버린다.
+    """
     accounts = get_account_info()
 
     # 오류 응답은 list 가 아닌 dict 로 돌아온다
     if not isinstance(accounts, list):
-        return 0.0
+        return None
 
     for account in accounts:
         if account.get("currency") == currency:
             try:
                 return float(account.get("balance", 0))
             except (TypeError, ValueError):
-                return 0.0
+                return None
 
     return 0.0
 
@@ -106,10 +111,13 @@ def get_held_currencies(accounts=None):
         if currency == "KRW":
             continue
         try:
-            if float(account.get("balance", 0)) > 0:
-                held.add(currency)
+            # 주문 중 잠금 수량(locked)도 보유로 본다. 시장가 매수 직후에는
+            # 수량이 locked 에 있어 balance 만 보면 "없음" 으로 오판한다.
+            total = float(account.get("balance", 0)) + float(account.get("locked", 0))
         except (TypeError, ValueError):
             continue
+        if total > 0:
+            held.add(currency)
     return held
 
 
@@ -287,7 +295,9 @@ def upbit_order(market, side, volume=None, price=None, ord_type="limit"):
             timeout=REQUEST_TIMEOUT,
         )
     except requests.RequestException as e:
-        return {"error": {"message": f"주문 요청 실패: {e}"}}
+        # 네트워크 오류는 일시적일 수 있으므로 표시해 둔다.
+        # 호출부는 이 표시를 보고 종목을 실패 목록에 올리지 않는다.
+        return {"error": {"message": f"주문 요청 실패: {e}"}, "transient": True}
 
     if response.status_code not in (200, 201):
         return {"error": _safe_json(response)}

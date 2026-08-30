@@ -11,7 +11,7 @@ from django.utils import timezone
 from . import indicators as ind
 from . import market_analysis as ma
 from .auto_trade import AutoTrader, FEE_RATE, MAX_POSITIONS
-from .models import AskRecord, FailedMarket, MarketVolumeRecord, TradeRecord
+from .models import AskRecord, DailyPnlRecord, FailedMarket, MarketVolumeRecord, TradeRecord
 from .utils import get_ticker_price, upbit_order
 
 
@@ -284,6 +284,10 @@ class PositionTests(TestCase):
 
     def test_사용자_수동매도를_감지해_정리한다(self):
         self.trader.open_position("KRW-BTC", 100.0, "uuid-1", 10000)
+        # 매수 직후 유예 시간을 지난 상태로 만든다
+        self.trader.positions["KRW-BTC"]["created_at"] = (
+            timezone.now() - timedelta(seconds=60)
+        )
         accounts = [{"currency": "KRW", "balance": "50000"}]  # BTC 없음
         self.trader.sync_manual_sells(accounts)
         self.assertNotIn("KRW-BTC", self.trader.positions)
@@ -573,6 +577,8 @@ class EndpointTests(TestCase):
         with mock.patch("trading.views.AutoTrader") as trader_cls, \
              mock.patch("trading.views.threading.Thread"):
             trader_cls.return_value.active = False
+            trader_cls.return_value.daily_pnl = 0.0
+            trader_cls.return_value.daily_loss_limit.return_value = -1000.0
             response = self.client.get("/auto_trade/start/", {"budget": "10000"})
         self.assertEqual(response.json()["status"], "started")
 
@@ -587,3 +593,221 @@ class EndpointTests(TestCase):
              mock.patch("trading.views.get_top_coin_info", return_value=[]):
             response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
+
+
+# ======================================================================
+# 점검에서 발견된 버그들의 회귀 테스트
+# ======================================================================
+
+class BalanceFailureSafetyTests(TestCase):
+    """ 버그 1: 계좌 조회 실패를 잔고 0 으로 오판해 포지션을 버리던 문제 """
+
+    def setUp(self):
+        self.trader = AutoTrader(budget=10000)
+        self.trader.open_position("KRW-BTC", 100.0, "u1", 10000)
+
+    def test_계좌_조회_실패시_매도하지_않고_포지션을_유지한다(self):
+        with mock.patch("trading.auto_trade.get_balance", return_value=None), \
+             mock.patch("trading.auto_trade.upbit_order") as order:
+            self.trader.sell_all("KRW-BTC", 98.0, "손절")
+
+        order.assert_not_called()
+        self.assertIn("KRW-BTC", self.trader.positions)          # 포지션 유지
+        self.assertTrue(TradeRecord.objects.get(market="KRW-BTC").is_active)
+
+    def test_실제_잔고_0이면_기존대로_정리한다(self):
+        with mock.patch("trading.auto_trade.get_balance", return_value=0.0), \
+             mock.patch("trading.auto_trade.upbit_order") as order:
+            self.trader.sell_all("KRW-BTC", 98.0, "손절")
+
+        order.assert_not_called()
+        self.assertNotIn("KRW-BTC", self.trader.positions)
+
+
+class ManualSellGraceTests(TestCase):
+    """ 버그 2: 매수 직후 체결 반영 전에 수동 매도로 오판하던 문제 """
+
+    def setUp(self):
+        self.trader = AutoTrader(budget=10000)
+        self.trader.open_position("KRW-XRP", 100.0, "u1", 10000)
+
+    def test_매수_직후에는_잔고에_없어도_정리하지_않는다(self):
+        accounts = [{"currency": "KRW", "balance": "50000"}]  # XRP 아직 미반영
+        self.trader.sync_manual_sells(accounts)
+        self.assertIn("KRW-XRP", self.trader.positions)
+
+    def test_유예시간이_지나면_수동_매도로_판정한다(self):
+        self.trader.positions["KRW-XRP"]["created_at"] = timezone.now() - timedelta(seconds=60)
+        accounts = [{"currency": "KRW", "balance": "50000"}]
+        self.trader.sync_manual_sells(accounts)
+        self.assertNotIn("KRW-XRP", self.trader.positions)
+
+    def test_locked_수량도_보유로_취급한다(self):
+        from trading.utils import get_held_currencies
+        accounts = [
+            {"currency": "KRW", "balance": "50000"},
+            {"currency": "XRP", "balance": "0", "locked": "10.5"},  # 주문 중 잠금
+        ]
+        self.assertIn("XRP", get_held_currencies(accounts))
+
+
+class BuyFeeHeadroomTests(TestCase):
+    """ 버그 3: 수수료 헤드룸 없이 전액 주문하다 거부되던 문제 """
+
+    def setUp(self):
+        self.trader = AutoTrader(budget=20000)
+
+    def buy_with(self, balance, order_result=None):
+        accounts = [{"currency": "KRW", "balance": str(balance)}]
+        coins = [coin("KRW-A", 0.05)]
+        books = {"KRW-A": orderbook("KRW-A")}
+        with mock.patch("trading.market_analysis.get_orderbooks", return_value=books), \
+             mock.patch("trading.auto_trade.upbit_order",
+                        return_value=order_result or {"uuid": "u1"}) as order:
+            self.trader.try_buy(accounts, coins)
+        return order
+
+    def test_잔고가_예산보다_적으면_수수료만큼_뺀_금액으로_주문한다(self):
+        order = self.buy_with(15000)
+        # 15000 / 1.0005 = 14992.xx -> 14992
+        self.assertEqual(order.call_args.kwargs["price"], 14992)
+
+    def test_잔고가_충분하면_예산_전액을_주문한다(self):
+        order = self.buy_with(100000)
+        self.assertEqual(order.call_args.kwargs["price"], 20000)
+
+    def test_일시적_오류는_실패_목록에_올리지_않는다(self):
+        self.buy_with(100000, order_result={
+            "error": {"message": "주문 요청 실패: timeout"}, "transient": True,
+        })
+        self.assertFalse(FailedMarket.objects.filter(market="KRW-A").exists())
+
+    def test_API_거부는_실패_목록에_올린다(self):
+        self.buy_with(100000, order_result={"error": {"name": "invalid_market"}})
+        self.assertTrue(FailedMarket.objects.filter(market="KRW-A").exists())
+
+
+class FailedMarketExpiryTests(TestCase):
+    """ 버그 4: 주문 실패 종목이 영구 제외되던 문제 """
+
+    def setUp(self):
+        self.trader = AutoTrader(budget=10000)
+
+    def test_1시간_이내_실패_종목은_제외된다(self):
+        FailedMarket.objects.create(market="KRW-BAD")
+        self.assertIn("KRW-BAD", self.trader.blocked_markets())
+
+    def test_1시간이_지나면_다시_매수_가능하다(self):
+        FailedMarket.objects.create(market="KRW-OLD")
+        FailedMarket.objects.update(failed_at=timezone.now() - timedelta(seconds=3700))
+        self.assertNotIn("KRW-OLD", self.trader.blocked_markets())
+
+
+class RebuyResetsHoldTimeTests(TestCase):
+    """ 버그 5: 재매수 시 이전 매수 시각이 남아 보유 시간이 왜곡되던 문제 """
+
+    def test_같은_종목을_다시_사면_매수_시각이_초기화된다(self):
+        trader = AutoTrader(budget=10000)
+        trader.open_position("KRW-ETH", 100.0, "u1", 10000)
+        # 이틀 전에 산 것처럼 조작 후 종료
+        TradeRecord.objects.filter(market="KRW-ETH").update(
+            created_at=timezone.now() - timedelta(days=2)
+        )
+        trader.close_position("KRW-ETH")
+
+        # 재매수
+        trader.open_position("KRW-ETH", 200.0, "u2", 10000)
+
+        held_seconds = (
+            timezone.now() - trader.positions["KRW-ETH"]["created_at"]
+        ).total_seconds()
+        self.assertLess(held_seconds, 5)  # 방금 산 것으로 계산되어야 한다
+
+        db_created = TradeRecord.objects.get(market="KRW-ETH").created_at
+        self.assertLess((timezone.now() - db_created).total_seconds(), 5)
+
+
+class DailyPnlPersistenceTests(TestCase):
+    """ 버그 7: 재시작·재시작 버튼으로 로스컷이 리셋되던 문제 """
+
+    def test_실현손익이_DB에_기록된다(self):
+        trader = AutoTrader(budget=10000)
+        trader.record_trade_result("KRW-A", 100.0, 98.0, 10000)
+        record = DailyPnlRecord.objects.get(date=trader.pnl_date)
+        self.assertAlmostEqual(record.realized_pnl, trader.daily_pnl)
+
+    def test_새_트레이더가_당일_손익을_복원한다(self):
+        first = AutoTrader(budget=10000)
+        for _ in range(5):
+            first.record_trade_result("KRW-A", 100.0, 98.0, 10000)
+        self.assertLessEqual(first.daily_pnl, first.daily_loss_limit())
+
+        # 재시작을 흉내 내 새 트레이더 생성
+        second = AutoTrader(budget=10000)
+        self.assertAlmostEqual(second.daily_pnl, first.daily_pnl)
+        second.active = True
+        self.assertTrue(second.check_loss_cut())  # 한도 상태가 유지된다
+
+    def test_시작_요청도_한도_상태면_거부된다(self):
+        trader = AutoTrader(budget=10000)
+        for _ in range(5):
+            trader.record_trade_result("KRW-A", 100.0, 98.0, 10000)
+
+        response = self.client.get("/auto_trade/start/", {"budget": "10000"})
+        self.assertEqual(response.json()["status"], "loss_cut")
+
+    def test_다른_날짜에는_영향이_없다(self):
+        DailyPnlRecord.objects.create(
+            date=date(2020, 1, 1), realized_pnl=-99999.0
+        )
+        trader = AutoTrader(budget=10000)
+        self.assertEqual(trader.daily_pnl, 0.0)
+
+
+class SellAllPnlRecoveryTests(TestCase):
+    """ 버그 6: 로스컷 청산 시 시세 조회 실패로 손익이 누락되던 문제 """
+
+    def test_시세가_None이면_한_번_더_조회해_손익을_기록한다(self):
+        trader = AutoTrader(budget=10000)
+        trader.open_position("KRW-A", 100.0, "u1", 10000)
+
+        with mock.patch("trading.auto_trade.get_balance", return_value=1.0), \
+             mock.patch("trading.auto_trade.is_order_done", return_value=True), \
+             mock.patch("trading.auto_trade.upbit_order", return_value={"uuid": "x"}), \
+             mock.patch("trading.auto_trade.get_ticker_price", return_value=90.0):
+            trader.sell_all("KRW-A", None, "🚨 로스컷 청산")
+
+        self.assertLess(trader.daily_pnl, 0)  # 손실이 누적에 반영됨
+
+
+class ThreadSafetyTests(TestCase):
+    """ 버그 8: 매매 스레드와 웹 요청 스레드의 경합 """
+
+    def test_positions_snapshot은_사본을_반환한다(self):
+        trader = AutoTrader(budget=10000)
+        trader.open_position("KRW-A", 100.0, "u1", 10000)
+        snapshot = trader.positions_snapshot()
+        snapshot.append("KRW-FAKE")
+        self.assertNotIn("KRW-FAKE", trader.positions)
+
+    def test_순회_중_변경에도_안전하다(self):
+        import threading as th
+        trader = AutoTrader(budget=10000)
+        errors = []
+
+        def mutate():
+            for i in range(300):
+                trader.open_position(f"KRW-T{i % 5}", 100.0, None, 10000)
+                trader.close_position(f"KRW-T{i % 5}")
+
+        def read():
+            try:
+                for _ in range(300):
+                    trader.positions_snapshot()
+            except RuntimeError as e:
+                errors.append(e)
+
+        threads = [th.Thread(target=mutate), th.Thread(target=read)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual(errors, [])

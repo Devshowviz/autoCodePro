@@ -1,16 +1,15 @@
 # trading/auto_trade.py
+import threading
 import time
 from datetime import datetime, timedelta, timezone as dt_timezone
 
 from django.utils import timezone
 
-from .indicators import calculate_rsi
 from .market_analysis import BULLISH, analyze_market_state, select_buy_target
-from .models import AskRecord, FailedMarket, TradeRecord
+from .models import AskRecord, DailyPnlRecord, FailedMarket, TradeRecord
 from .utils import (
     get_account_info,
     get_balance,
-    get_candles,
     get_held_currencies,
     get_krw_market_coin_info,
     get_ticker_price,
@@ -30,8 +29,11 @@ MAX_RETRY = 3                  # 루프 오류 연속 허용 횟수
 MAX_POSITIONS = 3              # 동시 보유 종목 수 상한
 MIN_KRW_BALANCE = 10000        # 이 금액 미만이면 매수 중단
 REBUY_BLOCK_SECONDS = 600      # 매도 후 같은 종목 재매수 차단 시간(10분)
+BUY_SETTLE_GRACE_SECONDS = 30  # 매수 직후 체결이 잔고에 반영될 때까지 기다리는 시간
 
-CANDLE_COUNT = 200             # 지표 계산용 초봉 개수
+# 버그 4: 주문 실패 종목 차단에 만료 시간을 둔다. 일시적 오류로 영구히
+# 매수 대상에서 빠지는 것을 막는다.
+FAILED_MARKET_BLOCK_SECONDS = 3600
 
 FEE_RATE = 0.0005              # 업비트 원화마켓 수수료(편도)
 
@@ -57,11 +59,16 @@ class AutoTrader:
         self.active = False
 
         # {market: {"buy_price", "highest_price", "uuid", "created_at", "buy_krw_price"}}
+        # 매매 스레드와 웹 요청 스레드가 함께 접근하므로 락으로 보호한다
         self.positions = {}
+        self.lock = threading.Lock()
 
         self.market_state = "neutral"
-        self.daily_pnl = 0.0
         self.pnl_date = self.today()
+        # 재시작하거나 새 트레이더를 만들어도 당일 손실 한도가 유지되도록
+        # 당일 누적 손익은 DB 에서 복원한다
+        record, _ = DailyPnlRecord.objects.get_or_create(date=self.pnl_date)
+        self.daily_pnl = record.realized_pnl
 
         self.restore_positions()
 
@@ -102,6 +109,11 @@ class AutoTrader:
     # 포지션 관리 (메모리 + DB 이중 관리)
     # ------------------------------------------------------------------
 
+    def positions_snapshot(self):
+        """ 웹 요청 스레드에서 안전하게 읽을 수 있는 보유 목록 사본 """
+        with self.lock:
+            return list(self.positions)
+
     def restore_positions(self):
         """ 재시작 시 DB 의 활성 거래를 메모리로 복원 """
         for record in TradeRecord.objects.filter(is_active=True):
@@ -117,7 +129,8 @@ class AutoTrader:
 
     def open_position(self, market, buy_price, order_uuid, buy_krw_price):
         """ 매수 성공 시 메모리와 DB 에 기록 """
-        record, _ = TradeRecord.objects.update_or_create(
+        now = timezone.now()
+        record, created = TradeRecord.objects.update_or_create(
             market=market,
             defaults={
                 "buy_price": buy_price,
@@ -127,17 +140,24 @@ class AutoTrader:
                 "buy_krw_price": buy_krw_price,
             },
         )
-        self.positions[market] = {
-            "buy_price": buy_price,
-            "highest_price": buy_price,
-            "uuid": order_uuid,
-            "created_at": record.created_at,
-            "buy_krw_price": buy_krw_price,
-        }
+        if not created:
+            # auto_now_add 는 최초 삽입 때만 찍히므로, 같은 종목을 다시 사면
+            # 예전 매수 시각이 남아 보유 시간 계산이 왜곡된다. 직접 갱신한다.
+            TradeRecord.objects.filter(pk=record.pk).update(created_at=now)
+
+        with self.lock:
+            self.positions[market] = {
+                "buy_price": buy_price,
+                "highest_price": buy_price,
+                "uuid": order_uuid,
+                "created_at": now if not created else record.created_at,
+                "buy_krw_price": buy_krw_price,
+            }
 
     def close_position(self, market):
         """ 보유 종료 처리 """
-        self.positions.pop(market, None)
+        with self.lock:
+            self.positions.pop(market, None)
         TradeRecord.objects.filter(market=market).update(is_active=False)
         AskRecord.objects.update_or_create(
             market=market, defaults={"recorded_at": timezone.now()}
@@ -147,18 +167,6 @@ class AutoTrader:
         """ 최고가 갱신 (메모리·DB 동시) """
         self.positions[market]["highest_price"] = price
         TradeRecord.objects.filter(market=market).update(highest_price=price)
-
-    # ------------------------------------------------------------------
-    # 지표
-    # ------------------------------------------------------------------
-
-    def get_rsi(self, market):
-        """ 초봉 데이터로 RSI 계산. 계산 불가하면 None """
-        candles = get_candles(market, count=CANDLE_COUNT)
-        if candles is None:
-            self.log(f"⚠️ 캔들 조회 실패: {market}")
-            return None
-        return calculate_rsi(candles["close"])
 
     # ------------------------------------------------------------------
     # 매매 루프
@@ -224,7 +232,18 @@ class AutoTrader:
         if held is None:
             return  # 계좌 조회 실패 시에는 건드리지 않는다
 
-        for market in list(self.positions):
+        now = timezone.now()
+        for market in self.positions_snapshot():
+            position = self.positions.get(market)
+            if position is None:
+                continue
+
+            # 시장가 매수 직후에는 체결이 잔고에 반영되기 전이라
+            # "보유 없음" 으로 보일 수 있다. 잠시 판정을 유예한다.
+            held_seconds = (now - position["created_at"]).total_seconds()
+            if held_seconds < BUY_SETTLE_GRACE_SECONDS:
+                continue
+
             if market.split("-")[-1] not in held:
                 self.log(f"👤 사용자 매도 감지: {market} - 보유 목록에서 제거합니다")
                 self.close_position(market)
@@ -239,7 +258,8 @@ class AutoTrader:
         if today != self.pnl_date:
             self.log(f"📅 날짜 변경 ({self.pnl_date} → {today}) - 당일 손익 초기화")
             self.pnl_date = today
-            self.daily_pnl = 0.0
+            record, _ = DailyPnlRecord.objects.get_or_create(date=today)
+            self.daily_pnl = record.realized_pnl
 
     def record_trade_result(self, market, buy_price, sell_price, buy_krw_price):
         """ 매도 후 실현손익을 당일 누적치에 반영 (§12 수수료 반영) """
@@ -249,6 +269,9 @@ class AutoTrader:
 
         pnl = (buy_krw_price or self.budget) * profit_rate
         self.daily_pnl += pnl
+        DailyPnlRecord.objects.update_or_create(
+            date=self.pnl_date, defaults={"realized_pnl": self.daily_pnl}
+        )
 
         profit_logs.append({
             "market": market,
@@ -289,8 +312,13 @@ class AutoTrader:
 
     def blocked_markets(self):
         """ 매수 제외 대상: 보유 중 + 주문 실패 이력 + 최근 매도 """
-        blocked = set(self.positions)
-        blocked |= set(FailedMarket.objects.values_list("market", flat=True))
+        blocked = set(self.positions_snapshot())
+
+        failed_threshold = timezone.now() - timedelta(seconds=FAILED_MARKET_BLOCK_SECONDS)
+        blocked |= set(
+            FailedMarket.objects.filter(failed_at__gte=failed_threshold)
+            .values_list("market", flat=True)
+        )
 
         threshold = timezone.now() - timedelta(seconds=REBUY_BLOCK_SECONDS)
         blocked |= set(
@@ -315,8 +343,12 @@ class AutoTrader:
 
         market = target["market"]
 
-        # 주문 금액이 잔고를 넘지 않도록 조정 (§3.2)
-        buy_krw_price = min(self.budget, available_krw)
+        # 주문 금액이 잔고를 넘지 않도록 조정 (§3.2).
+        # 업비트는 시장가 매수 시 금액 × (1 + 수수료) 를 잠그므로,
+        # 잔고 전액을 주문하면 수수료만큼 부족해 거부된다. 헤드룸을 뺀다.
+        buy_krw_price = min(self.budget, int(available_krw / (1 + FEE_RATE)))
+        if buy_krw_price < MIN_KRW_BALANCE:
+            return
 
         self.log(f"✅ 매수 시도: {market}, 금액: {buy_krw_price:,.0f}원 "
                  f"(변동률 {target['signed_change_rate'] * 100:+.2f}%)")
@@ -324,7 +356,10 @@ class AutoTrader:
         buy_order = upbit_order(market, "buy", price=buy_krw_price, ord_type="price")
         if "error" in buy_order:
             self.log(f"❌ 매수 실패: {market} - {buy_order['error']}")
-            FailedMarket.objects.get_or_create(market=market)
+            # 네트워크 오류 같은 일시적 실패는 종목 문제가 아니므로
+            # 실패 목록에 올리지 않는다 (다음 사이클에 다시 시도)
+            if not buy_order.get("transient"):
+                FailedMarket.objects.update_or_create(market=market)
             return
 
         self.open_position(
@@ -404,6 +439,13 @@ class AutoTrader:
         currency = market.split("-")[-1]
         volume = get_balance(currency)
 
+        if volume is None:
+            # 계좌 조회가 실패한 것이지 잔고가 없는 것이 아니다.
+            # 여기서 포지션을 정리하면 팔지도 않은 코인이 관리 밖으로
+            # 사라지므로, 보유 상태를 유지하고 다음 사이클에 다시 시도한다.
+            self.log(f"⚠️ 계좌 조회 실패로 매도 보류: {market} - 다음 사이클에 재시도")
+            return
+
         if volume <= 0:
             self.log(f"⚠️ 매도할 수량이 없음: {market} - 보유 상태를 정리합니다")
             self.close_position(market)
@@ -413,6 +455,11 @@ class AutoTrader:
         if "error" in sell_order:
             self.log(f"❌ 매도 실패: {market} - {sell_order['error']}")
             return
+
+        # 로스컷 청산처럼 호출 시점에 시세 조회가 실패했을 수 있다.
+        # 실현손익이 당일 누적에서 빠지지 않도록 한 번 더 조회한다.
+        if current_price is None:
+            current_price = get_ticker_price(market)
 
         price_text = f"{current_price:,}원" if current_price is not None else "시장가"
         self.log(f"{reason}: {market}, 가격: {price_text}, 수량: {volume}")
@@ -425,5 +472,7 @@ class AutoTrader:
             self.record_trade_result(
                 market, position["buy_price"], current_price, position["buy_krw_price"]
             )
+        elif position:
+            self.log(f"⚠️ {market} 시세 조회 실패로 실현손익을 기록하지 못했습니다")
 
         self.close_position(market)
