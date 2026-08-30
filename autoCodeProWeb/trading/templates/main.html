@@ -16,7 +16,7 @@
 
         /* 자동매매 로그 창 스크롤 가능 */
         #trade-log {
-            height: 200px;
+            height: 500px;
             overflow-y: auto; /* 로그 창만 스크롤 가능 */
             border: 1px solid #ccc;
             padding: 10px;
@@ -33,11 +33,26 @@
         .start { background-color: green; color: white; }
         .stop { background-color: red; color: white; }
         input[type="number"] { padding: 5px; width: 100px; }
+        .badge { display: inline-block; padding: 4px 10px; border-radius: 12px;
+                 font-weight: bold; color: #fff; }
+        .bullish { background-color: #d32f2f; }
+        .bearish { background-color: #1976d2; }
+        .neutral { background-color: #757575; }
+        .unknown { background-color: #bdbdbd; }
+        .status-on  { color: green; font-weight: bold; }
+        .status-off { color: #999;  font-weight: bold; }
     </style>
 </head>
 <body>
 {% load humanize %}
 <h2>업비트 자동매매 시스템</h2>
+
+<div class="section">
+    <strong>시장 상태:</strong> <span id="market-state" class="badge unknown">확인 중</span>
+    &nbsp;|&nbsp; <strong>자동매매:</strong> <span id="trading-status" class="status-off">중지</span>
+    &nbsp;|&nbsp; <strong>보유:</strong> <span id="positions">-</span>
+    &nbsp;|&nbsp; <strong>당일 손익:</strong> <span id="daily-pnl">0원</span>
+</div>
 
 
 <!-- 전체 계좌 조회 -->
@@ -105,9 +120,17 @@
     </div>
 </div>
 
+<!-- 최근 매도 체결 내역 -->
+<div class="section">
+    <h3>최근 매도 체결 내역</h3>
+    <table id="profit-table">
+        <tr><th>코인명</th><th>매수가</th><th>매도가</th><th>수익률</th><th>손익</th></tr>
+    </table>
+</div>
+
 <script>
     function updateAccountData() {
-        fetch("/api/account_data/")
+        fetch("/api/fetch_account_data/")
             .then(response => response.json())
             .then(data => {
                 let accountTable = "<tr><th>화폐</th><th>보유 수량</th><th>평균 매수가</th><th>현재 평가 금액</th></tr>";
@@ -126,7 +149,7 @@
     }
 
     function updateCoinData() {
-        fetch("/api/coin_data/")
+        fetch("/api/fetch_coin_data/")
             .then(response => response.json())
             .then(data => {
                 let coinTable = "<tr><th>코인명</th><th>현재가</th><th>전일 대비</th><th>24시간 거래대금</th></tr>";
@@ -179,9 +202,63 @@
             });
     }
 
-    setInterval(updateAccountData, 200);
-    setInterval(updateCoinData, 200);
-    setInterval(updateTradeLogs, 200);  // 1초마다 로그 갱신
+    function updateMarketState() {
+        fetch("/api/get_market_volume/")
+            .then(response => response.json())
+            .then(data => {
+                const el = document.getElementById("market-state");
+                const label = { bullish: "상승장", bearish: "하락장",
+                                neutral: "보합장", unknown: "확인 불가" };
+                el.textContent = label[data.state] || data.state;
+                el.className = "badge " + data.state;
+            });
+    }
+
+    function updateTradingStatus() {
+        fetch("/api/check_auto_trading/")
+            .then(response => response.json())
+            .then(data => {
+                const status = document.getElementById("trading-status");
+                status.textContent = data.running ? "실행 중" : "중지";
+                status.className = data.running ? "status-on" : "status-off";
+
+                document.getElementById("positions").textContent =
+                    data.positions.length ? data.positions.join(", ") : "-";
+
+                const pnl = document.getElementById("daily-pnl");
+                pnl.textContent = `${data.daily_pnl.toLocaleString()}원 `
+                    + `(한도 ${data.daily_loss_limit.toLocaleString()}원)`;
+                pnl.style.color = data.daily_pnl < 0 ? "blue" : "red";
+            });
+    }
+
+    function updateProfitLog() {
+        fetch("/api/recentProfitLog/")
+            .then(response => response.json())
+            .then(data => {
+                let rows = "<tr><th>코인명</th><th>매수가</th><th>매도가</th>"
+                         + "<th>수익률</th><th>손익</th></tr>";
+                data.profits.forEach(p => {
+                    const color = p.profit_rate >= 0 ? "red" : "blue";
+                    rows += `<tr>
+                            <td>${p.market}</td>
+                            <td>${p.buy_price.toLocaleString()}</td>
+                            <td>${p.sell_price.toLocaleString()}</td>
+                            <td style="color: ${color};">${p.profit_rate.toFixed(2)}%</td>
+                            <td style="color: ${color};">${p.pnl.toLocaleString()}원</td>
+                        </tr>`;
+                });
+                document.getElementById("profit-table").innerHTML = rows;
+            });
+    }
+
+    // §11.1 갱신 주기
+    setInterval(updateTradeLogs, 1000);      // 거래 로그 1초
+    setInterval(updateAccountData, 1000);    // 계좌 정보 1초
+    setInterval(updateCoinData, 2000);       // 코인 시세 2초
+    setInterval(updateMarketState, 3000);    // 시장 상태 3초
+    setInterval(updateProfitLog, 3000);      // 매도 체결 내역 3초
+    setInterval(updateTradingStatus, 5000);  // 자동매매 상태 5초
 </script>
 
 </body>

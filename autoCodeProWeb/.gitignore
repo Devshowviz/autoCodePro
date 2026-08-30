@@ -1,1 +1,14 @@
+# 환경변수 (API 키 포함 - 절대 커밋 금지)
 .env
+
+# 가상환경
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Django
+db.sqlite3
+*.log
