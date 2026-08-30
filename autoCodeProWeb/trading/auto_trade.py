@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone as dt_timezone
 
 from django.utils import timezone
 
-from .market_analysis import BULLISH, analyze_market_state, select_buy_target
+from .market_analysis import analyze_market_state, select_buy_target
 from .models import AskRecord, DailyPnlRecord, FailedMarket, TradeRecord
 from .utils import (
     get_account_info,
@@ -37,15 +37,10 @@ FAILED_MARKET_BLOCK_SECONDS = 3600
 
 FEE_RATE = 0.0005              # 업비트 원화마켓 수수료(편도)
 
-# --- §8 매도 전략 -----------------------------------------------------
-QUICK_PROFIT_RATE = 0.01           # +1% : 보합/하락장에서 즉시 매도
-TRAILING_ACTIVATE_RATE = 0.02      # +2% : 트레일링 스탑 활성화
-TRAILING_DROP_RATE = 0.01          # 최고점 대비 -1% 하락 시 매도
-STOP_LOSS_RATE = -0.02             # 일반 손절 -2%
-VOLATILE_STOP_LOSS_RATE = -0.04    # 고변동성 손절 -4%
-VOLATILE_CHANGE_RATE = 0.05        # 변동률 절댓값 5% 이상이면 고변동성
-HOLD_SECONDS_BULLISH = 360         # 상승장 보유 5분
-HOLD_SECONDS_OTHERWISE = 600       # 그 외 보유 10분
+# --- 매도 전략 -----------------------------------------------------
+# 시장 상태(상승/하락/보합)와 무관하게 매수가 기준 고정 비율로 청산한다.
+TAKE_PROFIT_RATE = 0.02        # 매수가 대비 +2% 익절
+STOP_LOSS_RATE = -0.02         # 매수가 대비 -2% 손절
 
 # --- 일일 손실 한도 ---------------------------------------------------
 # 당일 누적 실현손익이 매매원금 대비 이 비율에 도달하면 전량 청산 후 정지한다.
@@ -209,6 +204,8 @@ class AutoTrader:
             self.log("⚠️ 시세 조회 실패 - 이번 사이클 건너뜀")
             return
 
+        # 시장 상태는 매도 판단에 쓰지 않는다 (대시보드 표시와
+        # 24시간 거래량 기록 유지 목적으로만 계산)
         self.market_state, _ = analyze_market_state(coin_info_list)
         coin_by_market = {c["market"]: c for c in coin_info_list}
 
@@ -397,35 +394,15 @@ class AutoTrader:
             self.sell_all(market, current_price, reason)
 
     def decide_sell(self, market, position, current_price, change_rate, coin_info):
-        """ 매도 사유를 판단해 문자열로 반환. 매도하지 않으면 None """
-        highest_price = position["highest_price"]
+        """ 매도 사유를 판단해 문자열로 반환. 매도하지 않으면 None
 
-        # 8.4 손절 - 고변동성 종목은 더 넓게 잡는다
-        volatility = abs((coin_info or {}).get("signed_change_rate") or 0)
-        stop_rate = (
-            VOLATILE_STOP_LOSS_RATE if volatility >= VOLATILE_CHANGE_RATE else STOP_LOSS_RATE
-        )
-        if change_rate <= stop_rate:
-            label = "고변동성 손절" if stop_rate == VOLATILE_STOP_LOSS_RATE else "손절"
-            return f"🛑 {label} ({stop_rate:.0%})"
+        시장 상태와 무관하게 매수가 기준 고정 비율만 사용한다.
+        """
+        if change_rate <= STOP_LOSS_RATE:
+            return f"🛑 손절 매도 ({STOP_LOSS_RATE:.0%})"
 
-        # 8.2 트레일링 스탑 - +2% 도달 이후부터 작동
-        if highest_price >= position["buy_price"] * (1 + TRAILING_ACTIVATE_RATE):
-            if current_price <= highest_price * (1 - TRAILING_DROP_RATE):
-                return "🚀 매도 실행 (트레일링 스탑)"
-            return None
-
-        # 8.1 수익 실현 - 보합/하락장은 +1% 에서 즉시 정리
-        if change_rate >= QUICK_PROFIT_RATE and self.market_state != BULLISH:
-            return "🚀 익절 매도 (+1%, 보합/하락장)"
-
-        # 8.3 시간 기반 매도
-        hold_limit = (
-            HOLD_SECONDS_BULLISH if self.market_state == BULLISH else HOLD_SECONDS_OTHERWISE
-        )
-        held_seconds = (timezone.now() - position["created_at"]).total_seconds()
-        if held_seconds >= hold_limit and change_rate >= QUICK_PROFIT_RATE:
-            return f"⏱️ 시간 기반 매도 ({int(hold_limit / 60)}분 경과)"
+        if change_rate >= TAKE_PROFIT_RATE:
+            return f"🚀 익절 매도 (+{TAKE_PROFIT_RATE:.0%})"
 
         return None
 

@@ -368,6 +368,8 @@ class TryBuyTests(TestCase):
 # ======================================================================
 
 class SellDecisionTests(TestCase):
+    """ 매도 판단: 시장 상태와 무관하게 매수가 기준 고정 ±2% """
+
     def setUp(self):
         self.trader = AutoTrader(budget=10000)
         self.trader.open_position("KRW-A", 100.0, "u1", 10000)
@@ -377,79 +379,41 @@ class SellDecisionTests(TestCase):
         change = current_price / 100.0 - 1
         return self.trader.decide_sell("KRW-A", self.position, current_price, change, coin_info)
 
-    def test_손절_2퍼센트(self):
+    def test_2퍼센트_오르면_익절(self):
+        self.assertIn("익절", self.decide(102.0))
+
+    def test_2퍼센트_내리면_손절(self):
         self.assertIn("손절", self.decide(98.0))
 
-    def test_고변동성_종목은_4퍼센트에서_손절(self):
-        volatile = coin("KRW-A", change_rate=0.06)
-        self.assertIsNone(self.decide(98.0, volatile))          # -2% 로는 안 판다
-        self.assertIn("고변동성", self.decide(96.0, volatile))   # -4% 에서 판다
+    def test_2퍼센트_미만_변동은_보유(self):
+        self.assertIsNone(self.decide(101.9))
+        self.assertIsNone(self.decide(98.1))
 
-    def test_보합장은_1퍼센트에서_즉시_익절(self):
+    def test_상승장에서도_2퍼센트면_판다(self):
+        self.trader.market_state = ma.BULLISH
+        self.assertIn("익절", self.decide(102.0))
+
+    def test_하락장에서도_손절선은_2퍼센트(self):
+        self.trader.market_state = ma.BEARISH
+        self.assertIsNone(self.decide(98.5))     # -1.5% 는 보유
+        self.assertIn("손절", self.decide(98.0))
+
+    def test_고변동성_종목도_손절선은_2퍼센트(self):
+        volatile = coin("KRW-A", change_rate=0.08)  # 전일 +8% 종목
+        self.assertIn("손절", self.decide(98.0, volatile))
+
+    def test_1퍼센트_상승으로는_팔지_않는다(self):
         self.trader.market_state = ma.NEUTRAL
-        self.assertIn("익절", self.decide(101.0))
-
-    def test_상승장은_1퍼센트에서_팔지_않는다(self):
-        self.trader.market_state = ma.BULLISH
         self.assertIsNone(self.decide(101.0))
 
-    def test_2퍼센트_도달후_최고점_1퍼센트_하락하면_트레일링_매도(self):
-        self.trader.update_highest_price("KRW-A", 105.0)
-        self.assertIn("트레일링", self.decide(103.0))  # 105 * 0.99 = 103.95 >= 103
-
-    def test_트레일링_활성화후_소폭_하락은_보유(self):
-        self.trader.update_highest_price("KRW-A", 105.0)
-        self.assertIsNone(self.decide(104.5))
-
-    def test_2퍼센트_미도달이면_트레일링이_작동하지_않는다(self):
-        self.trader.market_state = ma.BULLISH
-        self.trader.update_highest_price("KRW-A", 101.5)
-        self.assertIsNone(self.decide(100.4))  # 최고점 -1% 이지만 아직 +2% 미도달
-
-    def test_상승장_5분_경과후_1퍼센트면_매도(self):
-        self.trader.market_state = ma.BULLISH
-        self.position["created_at"] = timezone.now() - timedelta(seconds=400)
-        self.assertIn("시간 기반", self.decide(101.0))
-
-    def test_상승장_5분_이전에는_1퍼센트라도_보유(self):
-        self.trader.market_state = ma.BULLISH
-        self.position["created_at"] = timezone.now() - timedelta(seconds=100)
-        self.assertIsNone(self.decide(101.0))
-
-    def test_상승장_시간경과해도_수익이_없으면_보유(self):
-        self.trader.market_state = ma.BULLISH
-        self.position["created_at"] = timezone.now() - timedelta(seconds=400)
-        self.assertIsNone(self.decide(100.2))
-
-    def test_조건_미달이면_보유한다(self):
-        self.trader.market_state = ma.BULLISH
+    def test_최고점_대비_하락만으로는_팔지_않는다(self):
+        # 101.9 까지 올랐다가 100.5 로 밀려도 ±2% 안이면 보유
+        self.trader.update_highest_price("KRW-A", 101.9)
         self.assertIsNone(self.decide(100.5))
 
-
-class CheckSellTests(TestCase):
-    """ 보유 종목 시세 재사용 및 최고가 갱신 """
-
-    def setUp(self):
-        self.trader = AutoTrader(budget=10000)
-        self.trader.open_position("KRW-A", 100.0, "u1", 10000)
-
-    def test_이미_받아온_시세를_재사용해_추가_조회하지_않는다(self):
-        with mock.patch("trading.auto_trade.get_ticker_price") as ticker, \
-             mock.patch.object(self.trader, "sell_all"):
-            self.trader.check_sell("KRW-A", coin("KRW-A", price=101.0))
-        ticker.assert_not_called()
-
-    def test_목록에_없는_종목은_개별_조회한다(self):
-        with mock.patch("trading.auto_trade.get_ticker_price", return_value=101.0) as ticker, \
-             mock.patch.object(self.trader, "sell_all"):
-            self.trader.check_sell("KRW-A", None)
-        ticker.assert_called_once_with("KRW-A")
-
-    def test_상승하면_최고가를_갱신한다(self):
-        with mock.patch.object(self.trader, "sell_all"):
-            self.trader.check_sell("KRW-A", coin("KRW-A", price=120.0))
-        self.assertEqual(self.trader.positions["KRW-A"]["highest_price"], 120.0)
-        self.assertEqual(TradeRecord.objects.get(market="KRW-A").highest_price, 120.0)
+    def test_보유_시간은_매도에_영향이_없다(self):
+        self.position["created_at"] = timezone.now() - timedelta(hours=2)
+        self.assertIsNone(self.decide(101.0))
 
 
 class SellExecutionTests(TestCase):
