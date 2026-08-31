@@ -69,6 +69,13 @@ class DailyPnlRecord(models.Model):
     date = models.DateField(unique=True)          # KST 기준 날짜
     realized_pnl = models.FloatField(default=0)   # 당일 누적 실현손익(원)
 
+    # 일일 손실 한도의 기준 원금. 그날 실제로 매매를 시작한 예산 중 가장 큰 값을
+    # 유지한다. 예산을 줄여도 한도가 함께 줄지 않는다.
+    principal = models.FloatField(default=0)
+
+    # 당일 로스컷이 발동했는지. 발동한 날에는 예산을 바꿔도 다시 시작할 수 없다.
+    locked = models.BooleanField(default=False)
+
     class Meta:
         verbose_name = "일일 실현손익"
         verbose_name_plural = "일일 실현손익"

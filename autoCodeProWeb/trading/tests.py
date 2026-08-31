@@ -10,6 +10,7 @@ from django.utils import timezone
 
 from . import indicators as ind
 from . import market_analysis as ma
+from . import views
 from .auto_trade import AutoTrader, FEE_RATE, MAX_POSITIONS
 from .models import AskRecord, DailyPnlRecord, FailedMarket, MarketVolumeRecord, TradeRecord
 from .utils import get_ticker_price, upbit_order
@@ -508,6 +509,11 @@ class ProfitAndLossCutTests(TestCase):
 # ======================================================================
 
 class EndpointTests(TestCase):
+    def tearDown(self):
+        # 시작 엔드포인트가 설정한 전역 트레이더가 다른 테스트로 새지 않게 한다
+        views.trader = None
+        views.trader_thread = None
+
     def test_모든_조회_엔드포인트가_JSON을_반환한다(self):
         paths = [
             "/api/trade_logs/",
@@ -543,6 +549,8 @@ class EndpointTests(TestCase):
             trader_cls.return_value.active = False
             trader_cls.return_value.daily_pnl = 0.0
             trader_cls.return_value.daily_loss_limit.return_value = -1000.0
+            trader_cls.return_value.blocking_limit.return_value = -1000.0
+            trader_cls.return_value.loss_cut_reached.return_value = False
             response = self.client.get("/auto_trade/start/", {"budget": "10000"})
         self.assertEqual(response.json()["status"], "started")
 
@@ -719,6 +727,78 @@ class DailyPnlPersistenceTests(TestCase):
 
         response = self.client.get("/auto_trade/start/", {"budget": "10000"})
         self.assertEqual(response.json()["status"], "loss_cut")
+
+    def test_예산을_키워도_로스컷을_우회할_수_없다(self):
+        """ 한도가 '당일 최대 예산' 기준이어도 예산 증액으로 재시작할 수 없다 """
+        trader = AutoTrader(budget=330000)
+        trader.commit_principal()               # 실제 매매 시작을 흉내
+        for _ in range(5):
+            trader.record_trade_result("KRW-A", 100.0, 98.0, 330000)
+        self.assertLessEqual(trader.daily_pnl, trader.blocking_limit())
+
+        # 같은 예산 → 거부
+        views.trader = None
+        same = self.client.get("/auto_trade/start/", {"budget": "330000"}).json()
+        self.assertEqual(same["status"], "loss_cut")
+
+        # 예산을 30배로 키워도 → 여전히 거부
+        views.trader = None
+        bigger = self.client.get("/auto_trade/start/", {"budget": "9999999"}).json()
+        self.assertEqual(bigger["status"], "loss_cut")
+
+    def test_거부된_요청은_당일_원금을_올리지_않는다(self):
+        trader = AutoTrader(budget=10000)
+        trader.commit_principal()
+        for _ in range(5):
+            trader.record_trade_result("KRW-A", 100.0, 98.0, 10000)
+
+        views.trader = None
+        self.client.get("/auto_trade/start/", {"budget": "9999999"})
+        record = DailyPnlRecord.objects.get(date=trader.pnl_date)
+        self.assertEqual(record.principal, 10000)
+
+    def test_거부되면_당일_로스컷이_잠긴다(self):
+        trader = AutoTrader(budget=10000)
+        trader.commit_principal()
+        for _ in range(5):
+            trader.record_trade_result("KRW-A", 100.0, 98.0, 10000)
+
+        views.trader = None
+        self.client.get("/auto_trade/start/", {"budget": "10000"})
+        self.assertTrue(DailyPnlRecord.objects.get(date=trader.pnl_date).locked)
+
+    def test_거부된_요청은_전역_트레이더를_남기지_않는다(self):
+        trader = AutoTrader(budget=10000)
+        trader.commit_principal()
+        for _ in range(5):
+            trader.record_trade_result("KRW-A", 100.0, 98.0, 10000)
+
+        views.trader = None
+        self.client.get("/auto_trade/start/", {"budget": "9999999"})
+        self.assertIsNone(views.trader)
+
+    def test_당일_최대_예산이_한도_기준이_된다(self):
+        """ 예산을 줄여 시작해도 한도는 그날 최대 예산 기준을 유지한다 """
+        first = AutoTrader(budget=500000)
+        first.commit_principal()
+        self.assertEqual(first.daily_loss_limit(), -50000.0)
+
+        smaller = AutoTrader(budget=100000)
+        self.assertEqual(smaller.principal, 500000.0)
+        self.assertEqual(smaller.daily_loss_limit(), -50000.0)
+
+    def test_트레이더가_없어도_대시보드가_당일_손익을_보여준다(self):
+        """ 서버 재시작 후 0원으로 표시되어 거부 사유와 어긋나던 문제 """
+        trader = AutoTrader(budget=330000)
+        trader.commit_principal()
+        for _ in range(5):
+            trader.record_trade_result("KRW-A", 100.0, 98.0, 330000)
+
+        views.trader = None
+        data = self.client.get("/api/check_auto_trading/").json()
+        self.assertEqual(data["daily_pnl"], round(trader.daily_pnl))
+        self.assertEqual(data["daily_loss_limit"], -33000)
+        self.assertTrue(data["loss_cut"])
 
     def test_다른_날짜에는_영향이_없다(self):
         DailyPnlRecord.objects.create(

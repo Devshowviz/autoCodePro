@@ -24,6 +24,12 @@ profit_logs = []     # 매도 체결 내역 (매수가/매도가/수익률)
 # zoneinfo 와 달리 Windows 에서 tzdata 패키지를 요구하지 않는다.
 KST = dt_timezone(timedelta(hours=9))
 
+
+def today_kst():
+    """ 업비트 기준(KST) 오늘 날짜 """
+    return datetime.now(KST).date()
+
+
 TRADE_INTERVAL_SECONDS = 1     # 매매 루프 주기(초)
 MAX_RETRY = 3                  # 루프 오류 연속 허용 횟수
 MAX_POSITIONS = 3              # 동시 보유 종목 수 상한
@@ -61,9 +67,17 @@ class AutoTrader:
         self.market_state = "neutral"
         self.pnl_date = self.today()
         # 재시작하거나 새 트레이더를 만들어도 당일 손실 한도가 유지되도록
-        # 당일 누적 손익은 DB 에서 복원한다
+        # 당일 누적 손익·원금·로스컷 상태를 DB 에서 복원한다
         record, _ = DailyPnlRecord.objects.get_or_create(date=self.pnl_date)
         self.daily_pnl = record.realized_pnl
+        self.daily_locked = record.locked
+
+        # 이미 매매에 쓰인 원금. 시작 가부 판정은 이 값으로만 하므로
+        # 예산 입력값을 키워도 한도가 넓어지지 않는다.
+        self.stored_principal = record.principal
+
+        # 한도 기준 원금은 '당일 최대 예산'
+        self.principal = max(record.principal, budget)
 
         self.restore_positions()
 
@@ -80,11 +94,45 @@ class AutoTrader:
 
     def today(self):
         """ 업비트 기준(KST) 오늘 날짜 """
-        return datetime.now(KST).date()
+        return today_kst()
 
     def daily_loss_limit(self):
-        """ 당일 허용 손실 한도(원, 음수) """
-        return self.budget * DAILY_LOSS_CUT_RATE
+        """ 당일 허용 손실 한도(원, 음수). 당일 최대 예산을 원금으로 삼는다. """
+        return self.principal * DAILY_LOSS_CUT_RATE
+
+    def blocking_limit(self):
+        """ 시작 가부 판정에 쓰는 한도(원, 음수).
+
+        한도는 당일 최대 예산 기준이라 예산을 키우면 함께 깊어진다. 그래서
+        판정에는 아직 확정되지 않은 이번 예산 대신, 이미 매매에 쓰인 원금만
+        사용한다. 그날 매매 이력이 없으면 이번 예산이 곧 원금이다.
+        """
+        return (self.stored_principal or self.principal) * DAILY_LOSS_CUT_RATE
+
+    def loss_cut_reached(self):
+        """ 당일 로스컷 상태인지 여부 """
+        return self.daily_locked or self.daily_pnl <= self.blocking_limit()
+
+    def daily_record(self):
+        """ 당일 손익 레코드 """
+        record, _ = DailyPnlRecord.objects.get_or_create(date=self.pnl_date)
+        return record
+
+    def commit_principal(self):
+        """ 실제로 매매를 시작할 때만 당일 원금을 확정한다 """
+        record = self.daily_record()
+        record.principal = max(record.principal, self.principal)
+        record.save(update_fields=["principal"])
+        self.stored_principal = record.principal
+        self.principal = record.principal
+
+    def lock_daily_loss_cut(self):
+        """ 당일 로스컷을 고정해 예산을 바꿔도 재시작할 수 없게 한다 """
+        record = self.daily_record()
+        if not record.locked:
+            record.locked = True
+            record.save(update_fields=["locked"])
+        self.daily_locked = True
 
     def get_available_krw(self, accounts=None):
         """ ✅ 현재 사용 가능한 원화(KRW) 잔고 조회 """
@@ -169,10 +217,14 @@ class AutoTrader:
 
     def start_trading(self):
         """자동매매 시작"""
+        # 원금은 매매를 실제로 시작하는 시점에만 확정한다. 시작이 거부되는
+        # 요청으로는 당일 최대 예산이 올라가지 않는다.
+        self.commit_principal()
         self.active = True
         self.log(
-            f"🚀 자동매매 시작됨! (매매원금 {self.budget:,}원 / "
-            f"일일 손실 한도 {self.daily_loss_limit():,.0f}원 / 최대 {MAX_POSITIONS}종목)"
+            f"🚀 자동매매 시작됨! (예산 {self.budget:,}원 / 한도 기준 원금 "
+            f"{self.principal:,.0f}원 / 일일 손실 한도 {self.daily_loss_limit():,.0f}원 "
+            f"/ 최대 {MAX_POSITIONS}종목)"
         )
 
         failures = 0
@@ -257,6 +309,10 @@ class AutoTrader:
             self.pnl_date = today
             record, _ = DailyPnlRecord.objects.get_or_create(date=today)
             self.daily_pnl = record.realized_pnl
+            self.daily_locked = record.locked
+            self.stored_principal = record.principal
+            self.principal = max(record.principal, self.budget)
+            self.commit_principal()
 
     def record_trade_result(self, market, buy_price, sell_price, buy_krw_price):
         """ 매도 후 실현손익을 당일 누적치에 반영 (§12 수수료 반영) """
@@ -266,9 +322,10 @@ class AutoTrader:
 
         pnl = (buy_krw_price or self.budget) * profit_rate
         self.daily_pnl += pnl
-        DailyPnlRecord.objects.update_or_create(
-            date=self.pnl_date, defaults={"realized_pnl": self.daily_pnl}
-        )
+        record = self.daily_record()
+        record.realized_pnl = self.daily_pnl
+        record.principal = max(record.principal, self.principal)
+        record.save(update_fields=["realized_pnl", "principal"])
 
         profit_logs.append({
             "market": market,
@@ -289,12 +346,14 @@ class AutoTrader:
 
     def check_loss_cut(self):
         """ 당일 손실 한도 도달 시 전량 청산 후 정지. 정지했으면 True """
-        if self.daily_pnl > self.daily_loss_limit():
+        if not self.loss_cut_reached():
             return False
 
+        # 예산을 바꿔 재시작하는 우회를 막기 위해 당일 로스컷을 DB 에 고정한다
+        self.lock_daily_loss_cut()
         self.log(
             f"🚨 일일 손실 한도 도달: 당일 누적 {self.daily_pnl:+,.0f}원 "
-            f"(한도 {self.daily_loss_limit():,.0f}원)"
+            f"(한도 {self.blocking_limit():,.0f}원)"
         )
 
         for market in list(self.positions):
