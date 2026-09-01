@@ -69,6 +69,10 @@ class DailyPnlRecord(models.Model):
     date = models.DateField(unique=True)          # KST 기준 날짜
     realized_pnl = models.FloatField(default=0)   # 당일 누적 실현손익(원)
 
+    # 손실 한도의 기준 총자산(원). 자동매매를 시작한 시점의 KRW 잔고와 보유 코인
+    # 평가액을 더한 값이며, 시작할 때마다 그 시점 값으로 다시 잡는다.
+    equity_base = models.FloatField(default=0)
+
     class Meta:
         verbose_name = "일일 실현손익"
         verbose_name_plural = "일일 실현손익"

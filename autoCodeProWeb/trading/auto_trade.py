@@ -24,6 +24,12 @@ profit_logs = []     # 매도 체결 내역 (매수가/매도가/수익률)
 # zoneinfo 와 달리 Windows 에서 tzdata 패키지를 요구하지 않는다.
 KST = dt_timezone(timedelta(hours=9))
 
+
+def today_kst():
+    """ 업비트 기준(KST) 오늘 날짜 """
+    return datetime.now(KST).date()
+
+
 TRADE_INTERVAL_SECONDS = 1     # 매매 루프 주기(초)
 MAX_RETRY = 3                  # 루프 오류 연속 허용 횟수
 MAX_POSITIONS = 3              # 동시 보유 종목 수 상한
@@ -42,9 +48,11 @@ FEE_RATE = 0.0005              # 업비트 원화마켓 수수료(편도)
 TAKE_PROFIT_RATE = 0.02        # 매수가 대비 +2% 익절
 STOP_LOSS_RATE = -0.02         # 매수가 대비 -2% 손절
 
-# --- 일일 손실 한도 ---------------------------------------------------
-# 당일 누적 실현손익이 매매원금 대비 이 비율에 도달하면 전량 청산 후 정지한다.
-DAILY_LOSS_CUT_RATE = -0.10
+# --- 손실 한도 --------------------------------------------------------
+# 이번 실행에서 발생한 실현손익이 '실행 시작 시점 총자산' 대비 이 비율에
+# 도달하면 전량 청산 후 정지한다. 정지 후 다시 시작할 수 있으며, 그때는
+# 그 시점 총자산으로 한도를 새로 잡는다.
+LOSS_CUT_RATE = -0.10
 
 
 class AutoTrader:
@@ -60,10 +68,18 @@ class AutoTrader:
 
         self.market_state = "neutral"
         self.pnl_date = self.today()
-        # 재시작하거나 새 트레이더를 만들어도 당일 손실 한도가 유지되도록
-        # 당일 누적 손익은 DB 에서 복원한다
+        # 서버를 재시작해도 당일 손익이 이어지도록 DB 에서 복원한다.
+        # 손익 초기화는 KST 00시(날짜 변경) 기준이다.
         record, _ = DailyPnlRecord.objects.get_or_create(date=self.pnl_date)
         self.daily_pnl = record.realized_pnl
+
+        # 손실 한도의 기준 총자산. begin_run() 에서 실행 시작 시점 값으로 잡는다.
+        self.equity_base = record.equity_base
+
+        # 이번 실행이 시작될 때의 당일 누적 손익. 한도 판정은 여기서부터
+        # 발생한 손익(run_pnl)으로 하므로, 정지 후 재시작이 즉시 다시
+        # 걸리지 않는다.
+        self.run_start_pnl = self.daily_pnl
 
         self.restore_positions()
 
@@ -80,11 +96,73 @@ class AutoTrader:
 
     def today(self):
         """ 업비트 기준(KST) 오늘 날짜 """
-        return datetime.now(KST).date()
+        return today_kst()
 
     def daily_loss_limit(self):
-        """ 당일 허용 손실 한도(원, 음수) """
-        return self.budget * DAILY_LOSS_CUT_RATE
+        """ 허용 손실 한도(원, 음수). 실행 시작 시점 총자산 기준. """
+        return self.equity_base * LOSS_CUT_RATE
+
+    def run_pnl(self):
+        """ 이번 실행이 시작된 뒤 발생한 실현손익 """
+        return self.daily_pnl - self.run_start_pnl
+
+    def loss_cut_reached(self):
+        """ 이번 실행의 손실이 한도에 닿았는지 여부 """
+        if self.equity_base <= 0:
+            # 총자산을 모르면 한도를 판정할 수 없다. 시작 시점에 걸러낸다.
+            return False
+        return self.run_pnl() <= self.daily_loss_limit()
+
+    def daily_record(self):
+        """ 당일 손익 레코드 """
+        record, _ = DailyPnlRecord.objects.get_or_create(date=self.pnl_date)
+        return record
+
+    def total_equity(self, accounts=None):
+        """ 현재 총자산(원): KRW 잔고 + 보유 코인 평가액.
+
+        조회에 실패하면 0 을 돌려준다. 0 은 '한도를 정할 수 없음' 을 뜻하며,
+        시작 시점에 오류로 처리한다.
+        """
+        if accounts is None:
+            accounts = get_account_info()
+
+        if not isinstance(accounts, list):
+            self.log(f"❌ 총자산 조회 실패: {accounts.get('error', accounts)}")
+            return 0.0
+
+        total = 0.0
+        for account in accounts:
+            currency = account.get("currency")
+            # 주문 중으로 잠긴 수량도 자산이다
+            amount = (
+                float(account.get("balance", 0) or 0)
+                + float(account.get("locked", 0) or 0)
+            )
+            if currency == "KRW":
+                total += amount
+                continue
+            if amount <= 0:
+                continue
+
+            price = get_ticker_price(f"KRW-{currency}")
+            if price:
+                total += amount * float(price)
+        return total
+
+    def begin_run(self):
+        """ 이번 실행의 손실 한도 기준을 잡는다.
+
+        시작할 때마다 그 시점 총자산으로 기준을 다시 잡고, 한도 판정의
+        출발점도 현재 당일 누적 손익으로 옮긴다. 그래서 정지 후 재시작하면
+        새 한도로 다시 매매할 수 있다.
+        """
+        self.equity_base = self.total_equity()
+        self.run_start_pnl = self.daily_pnl
+
+        record = self.daily_record()
+        record.equity_base = self.equity_base
+        record.save(update_fields=["equity_base"])
 
     def get_available_krw(self, accounts=None):
         """ ✅ 현재 사용 가능한 원화(KRW) 잔고 조회 """
@@ -171,8 +249,9 @@ class AutoTrader:
         """자동매매 시작"""
         self.active = True
         self.log(
-            f"🚀 자동매매 시작됨! (매매원금 {self.budget:,}원 / "
-            f"일일 손실 한도 {self.daily_loss_limit():,.0f}원 / 최대 {MAX_POSITIONS}종목)"
+            f"🚀 자동매매 시작됨! (매수금액 {self.budget:,}원 / 기준 총자산 "
+            f"{self.equity_base:,.0f}원 / 손실 한도 {self.daily_loss_limit():,.0f}원 "
+            f"/ 최대 {MAX_POSITIONS}종목)"
         )
 
         failures = 0
@@ -250,13 +329,17 @@ class AutoTrader:
     # ------------------------------------------------------------------
 
     def reset_daily_pnl_if_new_day(self):
-        """ 날짜(KST)가 바뀌면 당일 누적 손익을 초기화 """
+        """ 날짜(KST 00시)가 바뀌면 당일 누적 손익을 초기화 """
         today = self.today()
         if today != self.pnl_date:
             self.log(f"📅 날짜 변경 ({self.pnl_date} → {today}) - 당일 손익 초기화")
             self.pnl_date = today
             record, _ = DailyPnlRecord.objects.get_or_create(date=today)
             self.daily_pnl = record.realized_pnl
+            # 자정을 넘기면 한도 판정도 새 날의 출발점에서 다시 센다
+            self.run_start_pnl = self.daily_pnl
+            record.equity_base = self.equity_base
+            record.save(update_fields=["equity_base"])
 
     def record_trade_result(self, market, buy_price, sell_price, buy_krw_price):
         """ 매도 후 실현손익을 당일 누적치에 반영 (§12 수수료 반영) """
@@ -266,9 +349,10 @@ class AutoTrader:
 
         pnl = (buy_krw_price or self.budget) * profit_rate
         self.daily_pnl += pnl
-        DailyPnlRecord.objects.update_or_create(
-            date=self.pnl_date, defaults={"realized_pnl": self.daily_pnl}
-        )
+        record = self.daily_record()
+        record.realized_pnl = self.daily_pnl
+        record.equity_base = self.equity_base
+        record.save(update_fields=["realized_pnl", "equity_base"])
 
         profit_logs.append({
             "market": market,
@@ -283,18 +367,24 @@ class AutoTrader:
 
         self.log(
             f"💰 {market} 실현손익 {pnl:+,.0f}원 ({profit_rate * 100:+.2f}%) "
-            f"| 당일 누적 {self.daily_pnl:+,.0f}원 / 한도 {self.daily_loss_limit():,.0f}원"
+            f"| 당일 누적 {self.daily_pnl:+,.0f}원 "
+            f"| 이번 실행 {self.run_pnl():+,.0f}원 / 한도 {self.daily_loss_limit():,.0f}원"
         )
         return pnl
 
     def check_loss_cut(self):
-        """ 당일 손실 한도 도달 시 전량 청산 후 정지. 정지했으면 True """
-        if self.daily_pnl > self.daily_loss_limit():
+        """ 손실 한도 도달 시 전량 청산 후 정지. 정지했으면 True.
+
+        정지 후 다시 시작할 수 있다. 재시작하면 그 시점 총자산으로 한도를
+        새로 잡는다.
+        """
+        if not self.loss_cut_reached():
             return False
 
         self.log(
-            f"🚨 일일 손실 한도 도달: 당일 누적 {self.daily_pnl:+,.0f}원 "
-            f"(한도 {self.daily_loss_limit():,.0f}원)"
+            f"🚨 손실 한도 도달: 이번 실행 {self.run_pnl():+,.0f}원 "
+            f"(한도 {self.daily_loss_limit():,.0f}원 / 기준 총자산 "
+            f"{self.equity_base:,.0f}원) | 당일 누적 {self.daily_pnl:+,.0f}원"
         )
 
         for market in list(self.positions):
