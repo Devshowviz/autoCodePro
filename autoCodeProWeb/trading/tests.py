@@ -1,5 +1,5 @@
 # trading/tests.py
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from unittest import mock
 
 import jwt
@@ -452,9 +452,16 @@ class SellExecutionTests(TestCase):
 
 class ProfitAndLossCutTests(TestCase):
     def setUp(self):
-        self.trader = AutoTrader(budget=10000)  # 한도 -1,000원
+        self.trader = AutoTrader(budget=10000)
+        # 기준 총자산 10,000원 → 한도 -1,000원
+        self.trader.equity_base = 10000.0
 
-    def test_한도는_매매원금의_10퍼센트(self):
+    def test_한도는_기준_총자산의_10퍼센트(self):
+        self.assertEqual(self.trader.daily_loss_limit(), -1000.0)
+
+    def test_한도는_매수금액과_무관하다(self):
+        """ 매수금액을 바꿔도 한도는 기준 총자산으로만 정해진다 """
+        self.trader.budget = 500000
         self.assertEqual(self.trader.daily_loss_limit(), -1000.0)
 
     def test_실현손익은_왕복_수수료를_반영한다(self):
@@ -497,6 +504,26 @@ class ProfitAndLossCutTests(TestCase):
         self.trader.pnl_date = date(2020, 1, 1)
         self.trader.reset_daily_pnl_if_new_day()
         self.assertEqual(self.trader.daily_pnl, 0.0)
+
+    def test_초기화_기준일은_KST_00시다(self):
+        """ 자정(KST) 을 넘기는 순간 새 날짜가 되어 손익이 초기화된다 """
+        from trading.auto_trade import KST, today_kst
+
+        before = datetime(2026, 3, 4, 23, 59, 59, tzinfo=KST)
+        after = datetime(2026, 3, 5, 0, 0, 1, tzinfo=KST)
+
+        with mock.patch("trading.auto_trade.datetime") as dt:
+            dt.now.return_value = before
+            self.assertEqual(today_kst(), date(2026, 3, 4))
+            dt.now.return_value = after
+            self.assertEqual(today_kst(), date(2026, 3, 5))
+
+    def test_자정을_넘기면_한도_판정도_새로_센다(self):
+        self.trader.daily_pnl = -900.0
+        self.trader.run_start_pnl = 0.0
+        self.trader.pnl_date = date(2020, 1, 1)
+        self.trader.reset_daily_pnl_if_new_day()
+        self.assertEqual(self.trader.run_pnl(), 0.0)
 
     def test_같은_날에는_손익이_유지된다(self):
         self.trader.daily_pnl = -900.0
@@ -548,8 +575,8 @@ class EndpointTests(TestCase):
              mock.patch("trading.views.threading.Thread"):
             trader_cls.return_value.active = False
             trader_cls.return_value.daily_pnl = 0.0
+            trader_cls.return_value.equity_base = 10000.0
             trader_cls.return_value.daily_loss_limit.return_value = -1000.0
-            trader_cls.return_value.blocking_limit.return_value = -1000.0
             trader_cls.return_value.loss_cut_reached.return_value = False
             response = self.client.get("/auto_trade/start/", {"budget": "10000"})
         self.assertEqual(response.json()["status"], "started")
@@ -699,8 +726,62 @@ class RebuyResetsHoldTimeTests(TestCase):
         self.assertLess((timezone.now() - db_created).total_seconds(), 5)
 
 
+class TotalEquityTests(TestCase):
+    """ 손실 한도의 기준이 되는 총자산 계산 """
+
+    def setUp(self):
+        self.trader = AutoTrader(budget=10000)
+
+    def test_KRW_잔고만_있으면_그대로다(self):
+        accounts = [{"currency": "KRW", "balance": "1000000", "locked": "0"}]
+        self.assertEqual(self.trader.total_equity(accounts), 1000000.0)
+
+    def test_보유_코인은_현재가로_평가한다(self):
+        accounts = [
+            {"currency": "KRW", "balance": "500000", "locked": "0"},
+            {"currency": "BTC", "balance": "0.01", "locked": "0"},
+        ]
+        with mock.patch("trading.auto_trade.get_ticker_price", return_value=100000000.0):
+            # 500,000 + 0.01 * 100,000,000 = 1,500,000
+            self.assertEqual(self.trader.total_equity(accounts), 1500000.0)
+
+    def test_주문중으로_잠긴_수량도_자산에_넣는다(self):
+        accounts = [
+            {"currency": "KRW", "balance": "100000", "locked": "50000"},
+            {"currency": "XRP", "balance": "0", "locked": "10"},
+        ]
+        with mock.patch("trading.auto_trade.get_ticker_price", return_value=2000.0):
+            # (100,000 + 50,000) + 10 * 2,000 = 170,000
+            self.assertEqual(self.trader.total_equity(accounts), 170000.0)
+
+    def test_시세를_못_구한_코인은_건너뛴다(self):
+        accounts = [
+            {"currency": "KRW", "balance": "100000", "locked": "0"},
+            {"currency": "NOPE", "balance": "5", "locked": "0"},
+        ]
+        with mock.patch("trading.auto_trade.get_ticker_price", return_value=None):
+            self.assertEqual(self.trader.total_equity(accounts), 100000.0)
+
+    def test_계좌_조회_실패는_0이다(self):
+        self.assertEqual(self.trader.total_equity({"error": {"message": "실패"}}), 0.0)
+
+    def test_기준_총자산의_10퍼센트가_한도가_된다(self):
+        accounts = [{"currency": "KRW", "balance": "2000000", "locked": "0"}]
+        with mock.patch.object(self.trader, "total_equity", return_value=2000000.0):
+            self.trader.begin_run()
+        self.assertEqual(self.trader.equity_base, 2000000.0)
+        self.assertEqual(self.trader.daily_loss_limit(), -200000.0)
+
+
 class DailyPnlPersistenceTests(TestCase):
-    """ 버그 7: 재시작·재시작 버튼으로 로스컷이 리셋되던 문제 """
+    """ 당일 손익 보존과, 손실 한도 정지 후 재시작 """
+
+    def start(self, budget, equity):
+        """ 총자산을 고정한 채 시작 엔드포인트를 호출한다 """
+        views.trader = None
+        with mock.patch.object(AutoTrader, "total_equity", return_value=equity), \
+             mock.patch("trading.views.threading.Thread"):
+            return self.client.get("/auto_trade/start/", {"budget": str(budget)}).json()
 
     def test_실현손익이_DB에_기록된다(self):
         trader = AutoTrader(budget=10000)
@@ -710,87 +791,66 @@ class DailyPnlPersistenceTests(TestCase):
 
     def test_새_트레이더가_당일_손익을_복원한다(self):
         first = AutoTrader(budget=10000)
+        first.equity_base = 10000.0
         for _ in range(5):
             first.record_trade_result("KRW-A", 100.0, 98.0, 10000)
-        self.assertLessEqual(first.daily_pnl, first.daily_loss_limit())
 
-        # 재시작을 흉내 내 새 트레이더 생성
+        # 서버 재시작을 흉내 내 새 트레이더 생성
         second = AutoTrader(budget=10000)
         self.assertAlmostEqual(second.daily_pnl, first.daily_pnl)
-        second.active = True
-        self.assertTrue(second.check_loss_cut())  # 한도 상태가 유지된다
 
-    def test_시작_요청도_한도_상태면_거부된다(self):
+    def test_한도_정지_후_다시_시작할_수_있다(self):
+        """ 손실 한도로 멈춰도 재시작이 거부되지 않는다 """
         trader = AutoTrader(budget=10000)
+        trader.equity_base = 10000.0
+        trader.active = True
         for _ in range(5):
             trader.record_trade_result("KRW-A", 100.0, 98.0, 10000)
+        self.assertTrue(trader.check_loss_cut())
+        self.assertFalse(trader.active)
 
-        response = self.client.get("/auto_trade/start/", {"budget": "10000"})
-        self.assertEqual(response.json()["status"], "loss_cut")
+        self.assertEqual(self.start(10000, 9000.0)["status"], "started")
 
-    def test_예산을_키워도_로스컷을_우회할_수_없다(self):
-        """ 한도가 '당일 최대 예산' 기준이어도 예산 증액으로 재시작할 수 없다 """
-        trader = AutoTrader(budget=330000)
-        trader.commit_principal()               # 실제 매매 시작을 흉내
-        for _ in range(5):
-            trader.record_trade_result("KRW-A", 100.0, 98.0, 330000)
-        self.assertLessEqual(trader.daily_pnl, trader.blocking_limit())
-
-        # 같은 예산 → 거부
-        views.trader = None
-        same = self.client.get("/auto_trade/start/", {"budget": "330000"}).json()
-        self.assertEqual(same["status"], "loss_cut")
-
-        # 예산을 30배로 키워도 → 여전히 거부
-        views.trader = None
-        bigger = self.client.get("/auto_trade/start/", {"budget": "9999999"}).json()
-        self.assertEqual(bigger["status"], "loss_cut")
-
-    def test_거부된_요청은_당일_원금을_올리지_않는다(self):
+    def test_재시작하면_한도_판정이_새_구간에서_시작된다(self):
+        """ 당일 누적 손익은 남지만, 한도는 재시작 시점부터 다시 센다 """
         trader = AutoTrader(budget=10000)
-        trader.commit_principal()
+        trader.equity_base = 10000.0
         for _ in range(5):
             trader.record_trade_result("KRW-A", 100.0, 98.0, 10000)
+        losses = trader.daily_pnl
+        self.assertLessEqual(losses, -1000.0)
 
-        views.trader = None
-        self.client.get("/auto_trade/start/", {"budget": "9999999"})
-        record = DailyPnlRecord.objects.get(date=trader.pnl_date)
-        self.assertEqual(record.principal, 10000)
+        self.assertEqual(self.start(10000, 9000.0)["status"], "started")
+        restarted = views.trader
+        self.assertAlmostEqual(restarted.daily_pnl, losses)   # 당일 누적은 그대로
+        self.assertEqual(restarted.run_pnl(), 0.0)            # 판정은 0 에서 다시
+        self.assertFalse(restarted.loss_cut_reached())
 
-    def test_거부되면_당일_로스컷이_잠긴다(self):
-        trader = AutoTrader(budget=10000)
-        trader.commit_principal()
-        for _ in range(5):
-            trader.record_trade_result("KRW-A", 100.0, 98.0, 10000)
+    def test_재시작하면_기준_총자산을_그_시점_값으로_다시_잡는다(self):
+        self.assertEqual(self.start(10000, 900000.0)["status"], "started")
+        self.assertEqual(views.trader.equity_base, 900000.0)
+        self.assertEqual(views.trader.daily_loss_limit(), -90000.0)
 
-        views.trader = None
-        self.client.get("/auto_trade/start/", {"budget": "10000"})
-        self.assertTrue(DailyPnlRecord.objects.get(date=trader.pnl_date).locked)
+        self.assertEqual(self.start(10000, 500000.0)["status"], "started")
+        self.assertEqual(views.trader.equity_base, 500000.0)
+        self.assertEqual(views.trader.daily_loss_limit(), -50000.0)
 
-    def test_거부된_요청은_전역_트레이더를_남기지_않는다(self):
-        trader = AutoTrader(budget=10000)
-        trader.commit_principal()
-        for _ in range(5):
-            trader.record_trade_result("KRW-A", 100.0, 98.0, 10000)
-
-        views.trader = None
-        self.client.get("/auto_trade/start/", {"budget": "9999999"})
+    def test_총자산_조회_실패면_시작하지_않는다(self):
+        """ 한도를 정할 수 없는 채로 매매를 시작하지 않는다 """
+        result = self.start(10000, 0.0)
+        self.assertEqual(result["status"], "error")
         self.assertIsNone(views.trader)
 
-    def test_당일_최대_예산이_한도_기준이_된다(self):
-        """ 예산을 줄여 시작해도 한도는 그날 최대 예산 기준을 유지한다 """
-        first = AutoTrader(budget=500000)
-        first.commit_principal()
-        self.assertEqual(first.daily_loss_limit(), -50000.0)
-
-        smaller = AutoTrader(budget=100000)
-        self.assertEqual(smaller.principal, 500000.0)
-        self.assertEqual(smaller.daily_loss_limit(), -50000.0)
+    def test_기준_총자산을_모르면_로스컷을_판정하지_않는다(self):
+        trader = AutoTrader(budget=10000)
+        trader.equity_base = 0.0
+        trader.daily_pnl = -999999.0
+        self.assertFalse(trader.loss_cut_reached())
 
     def test_트레이더가_없어도_대시보드가_당일_손익을_보여준다(self):
-        """ 서버 재시작 후 0원으로 표시되어 거부 사유와 어긋나던 문제 """
-        trader = AutoTrader(budget=330000)
-        trader.commit_principal()
+        """ 서버 재시작 후 0원으로 표시되어 실제 손익을 감추던 문제 """
+        trader = AutoTrader(budget=10000)
+        trader.equity_base = 330000.0
         for _ in range(5):
             trader.record_trade_result("KRW-A", 100.0, 98.0, 330000)
 
@@ -798,7 +858,6 @@ class DailyPnlPersistenceTests(TestCase):
         data = self.client.get("/api/check_auto_trading/").json()
         self.assertEqual(data["daily_pnl"], round(trader.daily_pnl))
         self.assertEqual(data["daily_loss_limit"], -33000)
-        self.assertTrue(data["loss_cut"])
 
     def test_다른_날짜에는_영향이_없다(self):
         DailyPnlRecord.objects.create(
